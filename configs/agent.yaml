@@ -1,0 +1,47 @@
+# PlusClouds Agent Configuration
+# This file contains defaults; values are overridden by environment variables
+# (prefix: PLUSCLOUDS_AGENT_) and by the ISO config drive credentials.
+
+server:
+  http:
+    # Port for the REST API server
+    port: 8080
+  grpc:
+    # Port for the gRPC server
+    port: 8081
+  telemetry:
+    # Port for Prometheus metrics scraping
+    port: 9100
+
+auth:
+  # API key used to authenticate requests to this agent.
+  # Populated automatically from the ISO config drive (credentials.json).
+  # Can also be set via PLUSCLOUDS_AGENT_AUTH_API_KEY environment variable.
+  api_key: ""
+
+iso:
+  # Path where the PlusClouds config drive ISO is mounted.
+  mount_path: /media/plusclouds-config
+  # If true, fall back to environment variables when ISO files are not present.
+  # Useful for local development without an ISO.
+  fallback_env: true
+
+registry:
+  # PlusClouds control plane endpoint for registration and heartbeats.
+  # Populated automatically from the ISO config drive (credentials.json).
+  # Example: https://api.plusclouds.com
+  endpoint: ""
+  # How often the agent sends a heartbeat to the control plane.
+  heartbeat_interval: 30s
+
+log:
+  # Log level: debug, info, warn, error
+  level: info
+  # Log format: json or console
+  format: json
+
+autoheal:
+  # Enable automatic service restart on failure detection.
+  enabled: true
+  # How long to wait before restarting a failed service.
+  restart_delay: 10s

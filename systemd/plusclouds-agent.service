@@ -1,0 +1,55 @@
+[Unit]
+Description=PlusClouds Ubuntu VM Agent
+Documentation=https://docs.plusclouds.com/agent
+After=network-online.target
+Wants=network-online.target
+# Wait for systemd-resolved and the config drive to be available
+After=systemd-resolved.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Wait for the ISO config drive to be mounted before starting.
+# Tries up to 30 times with a 1-second delay (30 seconds total).
+ExecStartPre=/bin/bash -c '\
+  for i in $(seq 1 30); do \
+    if [ -d /media/plusclouds-config ] && mountpoint -q /media/plusclouds-config 2>/dev/null; then \
+      echo "PlusClouds config drive mounted."; \
+      exit 0; \
+    fi; \
+    echo "Waiting for PlusClouds config drive... attempt $i/30"; \
+    sleep 1; \
+  done; \
+  echo "WARNING: Config drive not found, starting in local-only mode."; \
+  exit 0'
+
+ExecStart=/usr/local/bin/plusclouds-agent --config /etc/plusclouds/agent.yaml
+
+# Always restart the service on any exit code
+Restart=always
+RestartSec=5
+
+# Standard output/error to journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=plusclouds-agent
+
+# Security hardening
+NoNewPrivileges=no
+PrivateTmp=false
+
+# Allow access to /sys and /proc for metric collection
+ProtectSystem=false
+ProtectHome=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment defaults (can be overridden here or via /etc/plusclouds/environment)
+EnvironmentFile=-/etc/plusclouds/environment
+
+[Install]
+WantedBy=multi-user.target

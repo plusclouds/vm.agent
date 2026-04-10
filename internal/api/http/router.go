@@ -86,6 +86,7 @@ func NewRouter(
 			r.Get("/", svcHandler.List)
 			r.Route("/{name}", func(r chi.Router) {
 				r.Get("/", svcHandler.Get)
+				r.Get("/status", svcHandler.Status)
 				r.Post("/start", svcHandler.Start)
 				r.Post("/stop", svcHandler.Stop)
 				r.Post("/restart", svcHandler.Restart)

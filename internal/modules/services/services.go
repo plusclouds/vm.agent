@@ -34,6 +34,9 @@ func ensureServiceSuffix(name string) string {
 
 // List returns information about all currently loaded systemd units.
 func (m *Module) List(ctx context.Context) ([]ServiceInfo, error) {
+	if m.bus == nil {
+		return nil, fmt.Errorf("systemd D-Bus is not available")
+	}
 	units, err := m.bus.ListUnitsContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing systemd units: %w", err)
@@ -52,6 +55,9 @@ func (m *Module) List(ctx context.Context) ([]ServiceInfo, error) {
 
 // Get returns detailed information for a single named unit.
 func (m *Module) Get(ctx context.Context, name string) (*ServiceInfo, error) {
+	if m.bus == nil {
+		return nil, fmt.Errorf("systemd D-Bus is not available")
+	}
 	name = ensureServiceSuffix(name)
 
 	units, err := m.bus.ListUnitsByNamesContext(ctx, []string{name})
@@ -68,6 +74,9 @@ func (m *Module) Get(ctx context.Context, name string) (*ServiceInfo, error) {
 
 // Start starts the named unit and waits for the job to complete.
 func (m *Module) Start(ctx context.Context, name string) (*ActionResult, error) {
+	if m.bus == nil {
+		return failResult(name, ActionStart, fmt.Errorf("systemd D-Bus is not available")), nil
+	}
 	name = ensureServiceSuffix(name)
 	m.logger.Info("starting service", zap.String("unit", name))
 
@@ -91,6 +100,9 @@ func (m *Module) Start(ctx context.Context, name string) (*ActionResult, error) 
 
 // Stop stops the named unit and waits for the job to complete.
 func (m *Module) Stop(ctx context.Context, name string) (*ActionResult, error) {
+	if m.bus == nil {
+		return failResult(name, ActionStop, fmt.Errorf("systemd D-Bus is not available")), nil
+	}
 	name = ensureServiceSuffix(name)
 	m.logger.Info("stopping service", zap.String("unit", name))
 
@@ -114,6 +126,9 @@ func (m *Module) Stop(ctx context.Context, name string) (*ActionResult, error) {
 
 // Restart restarts the named unit and waits for the job to complete.
 func (m *Module) Restart(ctx context.Context, name string) (*ActionResult, error) {
+	if m.bus == nil {
+		return failResult(name, ActionRestart, fmt.Errorf("systemd D-Bus is not available")), nil
+	}
 	name = ensureServiceSuffix(name)
 	m.logger.Info("restarting service", zap.String("unit", name))
 
@@ -137,6 +152,9 @@ func (m *Module) Restart(ctx context.Context, name string) (*ActionResult, error
 
 // Enable enables the named unit to start on boot.
 func (m *Module) Enable(ctx context.Context, name string) (*ActionResult, error) {
+	if m.bus == nil {
+		return failResult(name, ActionEnable, fmt.Errorf("systemd D-Bus is not available")), nil
+	}
 	name = ensureServiceSuffix(name)
 	m.logger.Info("enabling service", zap.String("unit", name))
 
@@ -158,6 +176,9 @@ func (m *Module) Enable(ctx context.Context, name string) (*ActionResult, error)
 
 // Disable disables the named unit from starting on boot.
 func (m *Module) Disable(ctx context.Context, name string) (*ActionResult, error) {
+	if m.bus == nil {
+		return failResult(name, ActionDisable, fmt.Errorf("systemd D-Bus is not available")), nil
+	}
 	name = ensureServiceSuffix(name)
 	m.logger.Info("disabling service", zap.String("unit", name))
 
@@ -179,6 +200,9 @@ func (m *Module) Disable(ctx context.Context, name string) (*ActionResult, error
 
 // Reload sends a reload signal to the named unit.
 func (m *Module) Reload(ctx context.Context, name string) (*ActionResult, error) {
+	if m.bus == nil {
+		return failResult(name, ActionReload, fmt.Errorf("systemd D-Bus is not available")), nil
+	}
 	name = ensureServiceSuffix(name)
 	m.logger.Info("reloading service", zap.String("unit", name))
 

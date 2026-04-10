@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -9,13 +10,26 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/modules/services"
 )
 
-// ServicesHandler wires the services module to HTTP endpoints.
-type ServicesHandler struct {
-	svc *services.Module
+// ServicesProvider is the interface the services handler depends on.
+// *services.Module satisfies this interface.
+type ServicesProvider interface {
+	List(ctx context.Context) ([]services.ServiceInfo, error)
+	Get(ctx context.Context, name string) (*services.ServiceInfo, error)
+	Start(ctx context.Context, name string) (*services.ActionResult, error)
+	Stop(ctx context.Context, name string) (*services.ActionResult, error)
+	Restart(ctx context.Context, name string) (*services.ActionResult, error)
+	Reload(ctx context.Context, name string) (*services.ActionResult, error)
+	Enable(ctx context.Context, name string) (*services.ActionResult, error)
+	Disable(ctx context.Context, name string) (*services.ActionResult, error)
 }
 
-// NewServicesHandler creates a ServicesHandler backed by the given services module.
-func NewServicesHandler(svc *services.Module) *ServicesHandler {
+// ServicesHandler wires the services module to HTTP endpoints.
+type ServicesHandler struct {
+	svc ServicesProvider
+}
+
+// NewServicesHandler creates a ServicesHandler backed by the given services provider.
+func NewServicesHandler(svc ServicesProvider) *ServicesHandler {
 	return &ServicesHandler{svc: svc}
 }
 
@@ -40,6 +54,32 @@ func (h *ServicesHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Success(w, info)
+}
+
+// Status handles GET /api/v1/services/{name}/status.
+// Returns the current state of a single named service.
+func (h *ServicesHandler) Status(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	info, err := h.svc.Get(r.Context(), name)
+	if err != nil {
+		response.Error(w, http.StatusNotFound, "SERVICE_NOT_FOUND", err.Error())
+		return
+	}
+	response.Success(w, struct {
+		Name     string               `json:"name"`
+		State    services.ServiceState `json:"state"`
+		SubState string               `json:"sub_state"`
+		Enabled  bool                 `json:"enabled"`
+		PID      uint32               `json:"pid,omitempty"`
+		Since    int64                `json:"since,omitempty"`
+	}{
+		Name:     info.Name,
+		State:    info.State,
+		SubState: info.SubState,
+		Enabled:  info.Enabled,
+		PID:      info.PID,
+		Since:    info.Since,
+	})
 }
 
 // Start handles POST /api/v1/services/{name}/start.

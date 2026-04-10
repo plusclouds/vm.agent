@@ -149,21 +149,14 @@ func (r *Registry) Register(ctx context.Context) error {
 		return fmt.Errorf("gathering system info for registration: %w", err)
 	}
 
-	ip := ""
-	if r.iso != nil && r.iso.Network != nil {
-		ip = r.iso.Network.IPAddress
-	}
-
 	payload := registrationPayload{
 		VMID:         r.vmID(),
 		TenantID:     r.tenantID(),
 		Hostname:     sysInfo.Hostname,
-		IPAddress:    ip,
+		IPAddress:    r.primaryIP(),
 		AgentVersion: config.AgentVersion,
 		Capabilities: agentCapabilities(),
-	}
-	if r.iso != nil && r.iso.Instance != nil {
-		payload.Labels = r.iso.Instance.Tags
+		Labels:       r.isoTags(),
 	}
 
 	url := endpoint + "/agents/register"
@@ -427,10 +420,30 @@ func (r *Registry) tenantID() string {
 }
 
 func (r *Registry) agentToken() string {
+	// Prefer a dedicated AgentToken from the ISO when available.
 	if r.iso != nil {
-		return r.iso.AgentToken()
+		if t := r.iso.AgentToken(); t != "" {
+			return t
+		}
+	}
+	// Fall back to cfg.Auth.APIKey. At startup, main.go populates this from
+	// iso.Password(), so it carries the VM's authentication credential even
+	// when the ISO schema does not include a separate agent_token field.
+	return r.cfg.Auth.APIKey
+}
+
+func (r *Registry) primaryIP() string {
+	if r.iso != nil {
+		return r.iso.PrimaryIP()
 	}
 	return ""
+}
+
+func (r *Registry) isoTags() map[string]string {
+	if r.iso != nil {
+		return r.iso.Tags()
+	}
+	return nil
 }
 
 func (r *Registry) endpoint() string {

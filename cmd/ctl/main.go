@@ -18,7 +18,6 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/modules/services"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
 	"github.com/plusclouds/ubuntu-agent/pkg/cmdutil"
-	"github.com/plusclouds/ubuntu-agent/pkg/isoconfig"
 )
 
 // Global flags.
@@ -311,39 +310,14 @@ func buildMetadataCmd() *cobra.Command {
 			Use:   "instance",
 			Short: "Show VM instance metadata",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return fetchAndPrint[isoconfig.InstanceMetadata]("/api/v1/metadata/instance",
-					func(v *isoconfig.InstanceMetadata) {
-						cmdutil.PrintTable(
-							[]string{"Field", "Value"},
-							[][]string{
-								{"VM ID", v.VMID},
-								{"Tenant ID", v.TenantID},
-								{"Tenant Name", v.TenantName},
-								{"Datacenter", v.Datacenter},
-								{"Region", v.Region},
-								{"Plan Tier", v.PlanTier},
-							},
-						)
-					})
+				return fetchRawAndPrint("/api/v1/metadata/instance")
 			},
 		},
 		&cobra.Command{
 			Use:   "network",
 			Short: "Show VM network metadata",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return fetchAndPrint[isoconfig.NetworkMetadata]("/api/v1/metadata/network",
-					func(v *isoconfig.NetworkMetadata) {
-						cmdutil.PrintTable(
-							[]string{"Field", "Value"},
-							[][]string{
-								{"Hostname", v.Hostname},
-								{"Domain", v.Domain},
-								{"IP Address", v.IPAddress},
-								{"Gateway", v.Gateway},
-								{"DNS", strings.Join(v.DNS, ", ")},
-							},
-						)
-					})
+				return fetchRawAndPrint("/api/v1/metadata/network")
 			},
 		},
 	)

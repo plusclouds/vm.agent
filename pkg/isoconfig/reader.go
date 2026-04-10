@@ -1,86 +1,213 @@
 // Package isoconfig reads VM metadata from the PlusClouds config-drive ISO.
-// The ISO is a vFAT/ISO9660 volume that contains several JSON files and a
-// cloud-init compatible user-data file. It is typically mounted at
-// /media/plusclouds-config by a udev rule or cloud-init datasource.
+// The ISO is mounted (typically at /media/plusclouds-config) and contains a
+// single YAML file named metadata.yaml with VM identity, network, disk, and
+// service role information. A JSON fallback (metadata.json) is also supported.
 package isoconfig
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"gopkg.in/yaml.v3"
 )
 
-// InstanceMetadata describes the virtual machine identity on the PlusClouds platform.
-type InstanceMetadata struct {
-	// VMID is the unique identifier for this virtual machine.
-	VMID string `json:"vm_id"`
-	// TenantID is the PlusClouds tenant/customer identifier.
-	TenantID string `json:"tenant_id"`
-	// TenantName is the human-readable tenant name.
-	TenantName string `json:"tenant_name"`
-	// Datacenter is the datacenter slug (e.g. "ist-1").
-	Datacenter string `json:"datacenter"`
-	// Region is the geographic region slug (e.g. "eu-west").
-	Region string `json:"region"`
-	// PlanTier is the compute plan identifier (e.g. "standard-2vcpu-4gb").
-	PlanTier string `json:"plan_tier"`
-	// Tags holds arbitrary key/value labels applied to the VM.
-	Tags map[string]string `json:"tags,omitempty"`
+// ---------------------------------------------------------------------------
+// Raw metadata types — mirror the exact YAML/JSON structure on the ISO.
+// ---------------------------------------------------------------------------
+
+// VirtualMachineMetadata is the top-level structure of the ISO config-drive
+// metadata file (metadata.yaml / metadata.json).
+type VirtualMachineMetadata struct {
+	Hostname            string                          `yaml:"hostname"             json:"hostname"`
+	Username            string                          `yaml:"username"             json:"username"`
+	Password            string                          `yaml:"password"             json:"password"`
+	VirtualMachineID    string                          `yaml:"virtual_machine_id"   json:"virtual_machine_id"`
+	VirtualDisks        DataList[VirtualDisk]           `yaml:"virtualDisks"         json:"virtualDisks"`
+	VirtualNetworkCards DataList[VirtualNetworkCard]    `yaml:"virtualNetworkCards"  json:"virtualNetworkCards"`
+	ServiceRoles        DataList[ServiceRole]           `yaml:"serviceRoles"         json:"serviceRoles"`
+	SSHPublicKeys       []string                        `yaml:"SSHPublicKeys"        json:"SSHPublicKeys"`
 }
 
-// NetworkMetadata describes the primary network configuration for the VM.
-type NetworkMetadata struct {
-	// IPAddress is the primary IPv4 address assigned to the VM.
-	IPAddress string `json:"ip_address"`
-	// Gateway is the default gateway IPv4 address.
-	Gateway string `json:"gateway"`
-	// DNS holds the list of nameserver IP addresses.
-	DNS []string `json:"dns,omitempty"`
-	// Hostname is the short hostname for the VM.
-	Hostname string `json:"hostname"`
-	// Domain is the DNS search domain (e.g. "tenant.plusclouds.net").
-	Domain string `json:"domain,omitempty"`
+// DataList is the generic wrapper used throughout the metadata for lists.
+// The API consistently uses { "data": [...] } as an envelope.
+type DataList[T any] struct {
+	Data []T `yaml:"data" json:"data"`
 }
 
-// ServiceEntry describes a single service that the orchestrator wants managed.
-type ServiceEntry struct {
-	// Name is the systemd unit name (e.g. "nginx.service").
-	Name string `json:"name"`
-	// Enabled indicates whether this service should be enabled on boot.
-	Enabled bool `json:"enabled"`
-	// Config holds optional service-specific configuration key/value pairs.
-	Config map[string]string `json:"config,omitempty"`
+// VirtualDisk describes one virtual disk attached to the VM.
+type VirtualDisk struct {
+	DiskType     string `yaml:"disk_type"     json:"disk_type"`
+	DeviceNumber int    `yaml:"device_number" json:"device_number"`
+	TotalDisk    int64  `yaml:"total_disk"    json:"total_disk"`
 }
 
-// ServicesManifest lists the services that the control plane wants the agent
-// to manage on this VM.
-type ServicesManifest struct {
-	Services []ServiceEntry `json:"services"`
+// VirtualNetworkCard describes one virtual NIC attached to the VM.
+type VirtualNetworkCard struct {
+	DeviceNumber int                  `yaml:"device_number" json:"device_number"`
+	MACAddr      string               `yaml:"mac_addr"      json:"mac_addr"`
+	Network      DataWrapper[Network] `yaml:"network"       json:"network"`
+	IPList       DataList[IPEntry]    `yaml:"ipList"        json:"ipList"`
 }
 
-// Credentials holds the secrets injected by the PlusClouds provisioner.
-// These are kept in memory only and never persisted to disk by the agent.
-type Credentials struct {
-	// APIKey is the shared secret for authenticating agent API requests.
-	APIKey string `json:"api_key"`
-	// ControlPlaneURL is the base URL of the PlusClouds control plane.
-	ControlPlaneURL string `json:"control_plane_url"`
-	// AgentToken is a per-VM JWT used when calling the control plane.
-	AgentToken string `json:"agent_token"`
+// DataWrapper wraps a single object under a "data" key.
+type DataWrapper[T any] struct {
+	Data T `yaml:"data" json:"data"`
 }
 
-// ISOMetadata is the aggregated metadata read from all ISO files.
+// Network holds the network configuration for a NIC's subnet.
+type Network struct {
+	IPAddr         string   `yaml:"ip_addr"         json:"ip_addr"`
+	IPRangeStart   string   `yaml:"ip_range_start"  json:"ip_range_start"`
+	IPRangeEnd     string   `yaml:"ip_range_end"    json:"ip_range_end"`
+	Gateway        *string  `yaml:"gateway"         json:"gateway"`
+	Subnet         string   `yaml:"subnet"          json:"subnet"`
+	Netmask        string   `yaml:"netmask"         json:"netmask"`
+	NetworkAddress string   `yaml:"network"         json:"network"`
+	DHCPServer     string   `yaml:"dhcp_server"     json:"dhcp_server"`
+	DNSNameservers []string `yaml:"dns_nameservers" json:"dns_nameservers"`
+	MTU            int      `yaml:"mtu"             json:"mtu"`
+}
+
+// IPEntry is an IP address assignment on a NIC.
+type IPEntry struct {
+	ID          string  `yaml:"id"           json:"id"`
+	IPAddr      string  `yaml:"ip_addr"      json:"ip_addr"`
+	Version     *string `yaml:"version"      json:"version"`
+	IsReachable *bool   `yaml:"is_reachable" json:"is_reachable"`
+}
+
+// ServiceRole describes a service role assigned to the VM by the orchestrator.
+type ServiceRole struct {
+	Name   string `yaml:"name"   json:"name"`
+	Config string `yaml:"config" json:"config,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// ISOMetadata — public façade over VirtualMachineMetadata
+// ---------------------------------------------------------------------------
+
+// ISOMetadata is the parsed config-drive metadata. All methods are nil-safe.
 type ISOMetadata struct {
-	Instance    *InstanceMetadata
-	Network     *NetworkMetadata
-	Services    *ServicesManifest
-	Credentials *Credentials
-	// UserData contains the raw cloud-init user-data string (may be empty).
-	UserData string
+	raw *VirtualMachineMetadata
 }
 
-// Reader reads metadata from a mounted config-drive ISO.
+// New wraps a VirtualMachineMetadata in an ISOMetadata. Useful in tests and
+// for constructing metadata from sources other than the config-drive file.
+func New(vm *VirtualMachineMetadata) *ISOMetadata {
+	return &ISOMetadata{raw: vm}
+}
+
+// Raw returns the underlying metadata struct. May be nil if the ISO was not
+// mounted or the metadata file was not found.
+func (m *ISOMetadata) Raw() *VirtualMachineMetadata {
+	if m == nil {
+		return nil
+	}
+	return m.raw
+}
+
+// VMID returns the virtual machine identifier (virtual_machine_id).
+func (m *ISOMetadata) VMID() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	return m.raw.VirtualMachineID
+}
+
+// Hostname returns the VM hostname from the metadata.
+func (m *ISOMetadata) Hostname() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	return m.raw.Hostname
+}
+
+// Username returns the default OS username provisioned on the VM.
+func (m *ISOMetadata) Username() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	return m.raw.Username
+}
+
+// Password returns the provisioned OS password.
+// This is sensitive — never log or expose it in API responses.
+func (m *ISOMetadata) Password() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	return m.raw.Password
+}
+
+// TenantID returns an empty string. Tenant information is not present in the
+// current metadata schema; it is resolved server-side from the agent token.
+func (m *ISOMetadata) TenantID() string { return "" }
+
+// APIKey returns the password field as the shared agent API key.
+// The password acts as the inbound authentication secret for API callers.
+func (m *ISOMetadata) APIKey() string { return m.Password() }
+
+// AgentToken returns an empty string. The per-VM provisioning token is not
+// carried in the metadata file; it is provided via a separate channel.
+func (m *ISOMetadata) AgentToken() string { return "" }
+
+// ControlPlaneURL returns an empty string. The control-plane URL is not
+// carried in the metadata file; configure it via the agent config file.
+func (m *ISOMetadata) ControlPlaneURL() string { return "" }
+
+// PrimaryIP returns the first assigned IP address from the first NIC, or "".
+// The address is in CIDR notation (e.g. "185.255.172.129/32").
+func (m *ISOMetadata) PrimaryIP() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	for _, nic := range m.raw.VirtualNetworkCards.Data {
+		if len(nic.IPList.Data) > 0 {
+			return nic.IPList.Data[0].IPAddr
+		}
+	}
+	return ""
+}
+
+// Gateway returns the gateway address from the first NIC's network config,
+// or "" if not set (gateway may be null in the metadata).
+func (m *ISOMetadata) Gateway() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	for _, nic := range m.raw.VirtualNetworkCards.Data {
+		if nic.Network.Data.Gateway != nil {
+			return *nic.Network.Data.Gateway
+		}
+	}
+	return ""
+}
+
+// DNSNameservers returns the DNS nameserver list from the first NIC, or nil.
+func (m *ISOMetadata) DNSNameservers() []string {
+	if m == nil || m.raw == nil {
+		return nil
+	}
+	for _, nic := range m.raw.VirtualNetworkCards.Data {
+		if len(nic.Network.Data.DNSNameservers) > 0 {
+			return nic.Network.Data.DNSNameservers
+		}
+	}
+	return nil
+}
+
+// Tags returns an empty map. Tags are not present in the current metadata
+// schema and will be populated by the orchestrator in future versions.
+func (m *ISOMetadata) Tags() map[string]string { return nil }
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+// Reader reads metadata from a mounted config-drive ISO directory.
 type Reader struct {
 	mountPath string
 }
@@ -90,115 +217,35 @@ func NewReader(mountPath string) *Reader {
 	return &Reader{mountPath: mountPath}
 }
 
-// Read attempts to read all metadata files from the ISO mount point.
-// Missing files are silently skipped; only JSON parse errors are returned.
-// Returns an empty but non-nil ISOMetadata if no files are present.
+// Read parses the metadata file from the ISO mount point and returns an
+// ISOMetadata. It tries metadata.yaml first, then metadata.json as a fallback.
+// If neither file is present the returned ISOMetadata is non-nil but empty
+// (all accessors will return zero values).
 func (r *Reader) Read() (*ISOMetadata, error) {
-	meta := &ISOMetadata{}
-
-	instance, err := readJSON[InstanceMetadata](filepath.Join(r.mountPath, "instance.json"))
-	if err != nil {
-		return nil, fmt.Errorf("reading instance.json: %w", err)
-	}
-	meta.Instance = instance
-
-	network, err := readJSON[NetworkMetadata](filepath.Join(r.mountPath, "network.json"))
-	if err != nil {
-		return nil, fmt.Errorf("reading network.json: %w", err)
-	}
-	meta.Network = network
-
-	services, err := readJSON[ServicesManifest](filepath.Join(r.mountPath, "services.json"))
-	if err != nil {
-		return nil, fmt.Errorf("reading services.json: %w", err)
-	}
-	meta.Services = services
-
-	creds, err := readJSON[Credentials](filepath.Join(r.mountPath, "credentials.json"))
-	if err != nil {
-		return nil, fmt.Errorf("reading credentials.json: %w", err)
-	}
-	meta.Credentials = creds
-
-	userData, err := readRawFile(filepath.Join(r.mountPath, "user-data"))
-	if err != nil {
-		return nil, fmt.Errorf("reading user-data: %w", err)
-	}
-	meta.UserData = userData
-
-	return meta, nil
-}
-
-// readJSON reads a JSON file at the given path and decodes it into T.
-// If the file does not exist, readJSON returns (nil, nil) — callers should
-// check for a nil pointer before using the result.
-func readJSON[T any](path string) (*T, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	// Try YAML first.
+	yamlPath := filepath.Join(r.mountPath, "metadata.yaml")
+	if data, err := os.ReadFile(yamlPath); err == nil {
+		var vm VirtualMachineMetadata
+		if err := yaml.Unmarshal(data, &vm); err != nil {
+			return nil, fmt.Errorf("parsing metadata.yaml: %w", err)
 		}
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return &ISOMetadata{raw: &vm}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("reading metadata.yaml: %w", err)
 	}
 
-	var out T
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	return &out, nil
-}
-
-// readRawFile reads a plain text file at the given path.
-// Returns an empty string without error if the file does not exist.
-func readRawFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
+	// Try JSON fallback.
+	jsonPath := filepath.Join(r.mountPath, "metadata.json")
+	if data, err := os.ReadFile(jsonPath); err == nil {
+		var vm VirtualMachineMetadata
+		if err := json.Unmarshal(data, &vm); err != nil {
+			return nil, fmt.Errorf("parsing metadata.json: %w", err)
 		}
-		return "", fmt.Errorf("reading %s: %w", path, err)
+		return &ISOMetadata{raw: &vm}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("reading metadata.json: %w", err)
 	}
-	return string(data), nil
-}
 
-// VMID returns the VM identifier from instance metadata, or "" if unavailable.
-func (m *ISOMetadata) VMID() string {
-	if m.Instance == nil {
-		return ""
-	}
-	return m.Instance.VMID
-}
-
-// TenantID returns the tenant identifier from instance metadata, or "" if unavailable.
-func (m *ISOMetadata) TenantID() string {
-	if m.Instance == nil {
-		return ""
-	}
-	return m.Instance.TenantID
-}
-
-// APIKey returns the API key from credentials, or "" if unavailable.
-func (m *ISOMetadata) APIKey() string {
-	if m.Credentials == nil {
-		return ""
-	}
-	return m.Credentials.APIKey
-}
-
-// ControlPlaneURL returns the control plane URL from credentials, or "" if unavailable.
-func (m *ISOMetadata) ControlPlaneURL() string {
-	if m.Credentials == nil {
-		return ""
-	}
-	return m.Credentials.ControlPlaneURL
-}
-
-// AgentToken returns the per-VM provisioning token from credentials, or "" if unavailable.
-// This token is sent to the orchestrator during registration and is distinct from the
-// SessionToken the orchestrator issues in response.
-func (m *ISOMetadata) AgentToken() string {
-	if m.Credentials == nil {
-		return ""
-	}
-	return m.Credentials.AgentToken
+	// Neither file present — return empty metadata (local-only / dev mode).
+	return &ISOMetadata{}, nil
 }

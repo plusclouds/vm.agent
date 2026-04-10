@@ -2,6 +2,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/plusclouds/ubuntu-agent/internal/api/http/response"
@@ -9,13 +10,24 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
 )
 
-// SystemHandler wires the system module to HTTP endpoints.
-type SystemHandler struct {
-	sys *system.Module
+// SystemProvider is the interface the system handler depends on.
+// *system.Module satisfies this interface.
+type SystemProvider interface {
+	GetInfo(ctx context.Context) (*system.SystemInfo, error)
+	GetMetrics(ctx context.Context) (*system.SystemMetrics, error)
+	GetCPU(ctx context.Context) (*system.CPUStats, error)
+	GetMemory(ctx context.Context) (*system.MemoryStats, error)
+	GetDisk(ctx context.Context) (*system.DiskStats, error)
+	GetNetwork(ctx context.Context) (*system.NetworkStats, error)
 }
 
-// NewSystemHandler creates a SystemHandler backed by the given system module.
-func NewSystemHandler(sys *system.Module) *SystemHandler {
+// SystemHandler wires the system module to HTTP endpoints.
+type SystemHandler struct {
+	sys SystemProvider
+}
+
+// NewSystemHandler creates a SystemHandler backed by the given system provider.
+func NewSystemHandler(sys SystemProvider) *SystemHandler {
 	return &SystemHandler{sys: sys}
 }
 

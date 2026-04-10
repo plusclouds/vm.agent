@@ -105,18 +105,22 @@ func run(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dbusConn, err := dbus.NewSystemdConnectionContext(ctx)
+	var dbusConn *dbus.Conn
+	dbusConn, err = dbus.NewSystemdConnectionContext(ctx)
 	if err != nil {
-		return fmt.Errorf("connecting to systemd D-Bus: %w", err)
+		logger.Warn("could not connect to systemd D-Bus; service management will be unavailable",
+			zap.Error(err),
+		)
+	} else {
+		defer dbusConn.Close()
+		logger.Info("connected to systemd D-Bus")
 	}
-	defer dbusConn.Close()
-	logger.Info("connected to systemd D-Bus")
 
 	// ------------------------------------------------------------------ //
 	// 5. Initialise modules
 	// ------------------------------------------------------------------ //
 	sysMod := system.New(iso)
-	svcMod := services.New(dbusConn, logger)
+	svcMod := services.New(dbusConn, logger) // dbusConn may be nil in dev/non-root mode
 	logger.Info("system and services modules initialised")
 
 	// ------------------------------------------------------------------ //

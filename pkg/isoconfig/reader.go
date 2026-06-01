@@ -21,14 +21,15 @@ import (
 // VirtualMachineMetadata is the top-level structure of the ISO config-drive
 // metadata file (metadata.yaml / metadata.json).
 type VirtualMachineMetadata struct {
-	Hostname            string                          `yaml:"hostname"             json:"hostname"`
-	Username            string                          `yaml:"username"             json:"username"`
-	Password            string                          `yaml:"password"             json:"password"`
-	VirtualMachineID    string                          `yaml:"virtual_machine_id"   json:"virtual_machine_id"`
-	VirtualDisks        DataList[VirtualDisk]           `yaml:"virtualDisks"         json:"virtualDisks"`
-	VirtualNetworkCards DataList[VirtualNetworkCard]    `yaml:"virtualNetworkCards"  json:"virtualNetworkCards"`
-	ServiceRoles        DataList[ServiceRole]           `yaml:"serviceRoles"         json:"serviceRoles"`
-	SSHPublicKeys       []string                        `yaml:"SSHPublicKeys"        json:"SSHPublicKeys"`
+	Hostname            string                       `yaml:"hostname"             json:"hostname"`
+	Username            string                       `yaml:"username"             json:"username"`
+	Password            string                       `yaml:"password"             json:"password"`
+	AgentAPIKey         string                       `yaml:"agent_api_key"        json:"agent_api_key"`
+	VirtualMachineID    string                       `yaml:"virtual_machine_id"   json:"virtual_machine_id"`
+	VirtualDisks        DataList[VirtualDisk]        `yaml:"virtualDisks"         json:"virtualDisks"`
+	VirtualNetworkCards DataList[VirtualNetworkCard] `yaml:"virtualNetworkCards"  json:"virtualNetworkCards"`
+	ServiceRoles        DataList[ServiceRole]        `yaml:"serviceRoles"         json:"serviceRoles"`
+	SSHPublicKeys       []string                     `yaml:"SSHPublicKeys"        json:"SSHPublicKeys"`
 }
 
 // DataList is the generic wrapper used throughout the metadata for lists.
@@ -147,12 +148,20 @@ func (m *ISOMetadata) Password() string {
 func (m *ISOMetadata) TenantID() string { return "" }
 
 // APIKey returns the password field as the shared agent API key.
-// The password acts as the inbound authentication secret for API callers.
 func (m *ISOMetadata) APIKey() string { return m.Password() }
 
-// AgentToken returns an empty string. The per-VM provisioning token is not
-// carried in the metadata file; it is provided via a separate channel.
-func (m *ISOMetadata) AgentToken() string { return "" }
+// AgentAPIKey returns the NATS authentication token for this agent.
+// It is stored in the agent_api_key field of the ISO metadata and used
+// as the NATS password during connection (user = VMID, password = AgentAPIKey).
+func (m *ISOMetadata) AgentAPIKey() string {
+	if m == nil || m.raw == nil {
+		return ""
+	}
+	return m.raw.AgentAPIKey
+}
+
+// AgentToken returns the NATS agent API key (alias for AgentAPIKey).
+func (m *ISOMetadata) AgentToken() string { return m.AgentAPIKey() }
 
 // ControlPlaneURL returns an empty string. The control-plane URL is not
 // carried in the metadata file; configure it via the agent config file.

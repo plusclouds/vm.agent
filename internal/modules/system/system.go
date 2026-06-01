@@ -3,6 +3,8 @@ package system
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -18,11 +20,14 @@ import (
 // Module collects system information and resource metrics from the host VM.
 type Module struct {
 	iso *isoconfig.ISOMetadata
+
+	// Disk IO delta state — protected by mu.
+	mu       sync.Mutex
+	prevIO   map[string]disk.IOCountersStat
+	prevIOAt time.Time
 }
 
-// New creates a new system Module. iso may be a zero-value ISOMetadata
-// (e.g. when running without a config drive); VMID and TenantID will
-// simply be empty in that case.
+// New creates a new system Module.
 func New(iso *isoconfig.ISOMetadata) *Module {
 	return &Module{iso: iso}
 }
@@ -51,7 +56,7 @@ func (m *Module) GetInfo(ctx context.Context) (*SystemInfo, error) {
 	return si, nil
 }
 
-// GetMetrics returns a point-in-time snapshot of all resource metrics.
+// GetMetrics returns a point-in-time snapshot conforming to the protocol schema.
 func (m *Module) GetMetrics(ctx context.Context) (*SystemMetrics, error) {
 	cpuStats, err := m.GetCPU(ctx)
 	if err != nil {
@@ -63,48 +68,35 @@ func (m *Module) GetMetrics(ctx context.Context) (*SystemMetrics, error) {
 		return nil, fmt.Errorf("collecting memory metrics: %w", err)
 	}
 
-	diskStats, err := m.GetDisk(ctx)
+	disks, err := m.GetDisk(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("collecting disk metrics: %w", err)
 	}
 
-	netStats, err := m.GetNetwork(ctx)
+	network, err := m.GetNetwork(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("collecting network metrics: %w", err)
 	}
 
 	return &SystemMetrics{
-		CPU:         *cpuStats,
-		Memory:      *memStats,
-		Disk:        *diskStats,
-		Network:     *netStats,
-		CollectedAt: time.Now().Unix(),
+		CPU:     *cpuStats,
+		Memory:  *memStats,
+		Disks:   disks,
+		Network: network,
 	}, nil
 }
 
-// GetCPU returns current CPU utilisation and load average data.
-// It samples CPU usage over a 500 ms window.
+// GetCPU returns CPU utilisation, load averages, and per-core usage.
+// Overall and per-core usage are sampled over a 500 ms window.
 func (m *Module) GetCPU(ctx context.Context) (*CPUStats, error) {
-	// Percent with interval=0 returns usage since last call (or since boot on
-	// first call). We use a short non-zero interval for a meaningful reading.
-	percents, err := cpu.PercentWithContext(ctx, 500*time.Millisecond, false)
+	// Overall usage (percpu=false).
+	overall, err := cpu.PercentWithContext(ctx, 500*time.Millisecond, false)
 	if err != nil {
-		return nil, fmt.Errorf("cpu.Percent: %w", err)
+		return nil, fmt.Errorf("cpu.Percent (overall): %w", err)
 	}
-
 	var usagePct float64
-	if len(percents) > 0 {
-		usagePct = percents[0]
-	}
-
-	infos, err := cpu.InfoWithContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("cpu.Info: %w", err)
-	}
-
-	modelName := ""
-	if len(infos) > 0 {
-		modelName = infos[0].ModelName
+	if len(overall) > 0 {
+		usagePct = overall[0]
 	}
 
 	coreCount, err := cpu.CountsWithContext(ctx, true)
@@ -112,74 +104,141 @@ func (m *Module) GetCPU(ctx context.Context) (*CPUStats, error) {
 		return nil, fmt.Errorf("cpu.Counts: %w", err)
 	}
 
-	avg, err := load.AvgWithContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("load.Avg: %w", err)
+	// Per-core usage (percpu=true). Uses the same 500 ms already elapsed above,
+	// so this call returns immediately (interval=0 reuses the cached sample).
+	var cores []CoreStat
+	perCore, err := cpu.PercentWithContext(ctx, 0, true)
+	if err == nil && len(perCore) > 0 {
+		cores = make([]CoreStat, len(perCore))
+		for i, pct := range perCore {
+			cores[i] = CoreStat{ID: i, UsagePct: pct}
+		}
+	}
+	// If per-core data fails, omit the field (nil slice → omitempty).
+
+	var loadAvg [3]float64
+	if avg, err := load.AvgWithContext(ctx); err == nil {
+		loadAvg = [3]float64{avg.Load1, avg.Load5, avg.Load15}
 	}
 
 	return &CPUStats{
-		UsagePercent: usagePct,
-		CoreCount:    coreCount,
-		ModelName:    modelName,
-		LoadAvg1:     avg.Load1,
-		LoadAvg5:     avg.Load5,
-		LoadAvg15:    avg.Load15,
+		UsagePct:  usagePct,
+		CoreCount: coreCount,
+		LoadAvg:   loadAvg,
+		Cores:     cores,
 	}, nil
 }
 
-// GetMemory returns current RAM and swap utilisation.
+// GetMemory returns current RAM utilisation.
 func (m *Module) GetMemory(ctx context.Context) (*MemoryStats, error) {
 	vm, err := mem.VirtualMemoryWithContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mem.VirtualMemory: %w", err)
 	}
 
-	sm, err := mem.SwapMemoryWithContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("mem.SwapMemory: %w", err)
-	}
-
 	return &MemoryStats{
-		TotalBytes:   vm.Total,
-		UsedBytes:    vm.Used,
-		FreeBytes:    vm.Free,
-		UsagePercent: vm.UsedPercent,
-		SwapTotal:    sm.Total,
-		SwapUsed:     sm.Used,
+		TotalBytes: vm.Total,
+		UsedBytes:  vm.Used,
+		UsagePct:   vm.UsedPercent,
 	}, nil
 }
 
-// GetDisk returns usage data for all locally mounted partitions.
-// Pseudo-filesystems (proc, sys, devtmpfs, etc.) are skipped.
-func (m *Module) GetDisk(ctx context.Context) (*DiskStats, error) {
+// pseudoFS is the set of filesystem types excluded from disk telemetry.
+var pseudoFS = map[string]bool{
+	"tmpfs": true, "devtmpfs": true, "proc": true, "sysfs": true,
+	"devpts": true, "cgroup": true, "cgroup2": true, "pstore": true,
+	"hugetlbfs": true, "mqueue": true, "debugfs": true, "tracefs": true,
+	"securityfs": true, "fusectl": true, "configfs": true, "bpf": true,
+	"overlay": true, "squashfs": true, "efivarfs": true,
+}
+
+// GetDisk returns usage and I/O stats for real block-device partitions only.
+// I/O rates are calculated as a delta from the previous call; the io field is
+// omitted on the first call (no baseline).
+func (m *Module) GetDisk(ctx context.Context) ([]DiskEntry, error) {
 	partitions, err := disk.PartitionsWithContext(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("disk.Partitions: %w", err)
 	}
 
-	var stats []PartitionStats
-	for _, p := range partitions {
-		usage, err := disk.UsageWithContext(ctx, p.Mountpoint)
-		if err != nil {
-			// Some pseudo-mounts may fail; skip them gracefully.
-			continue
-		}
-		stats = append(stats, PartitionStats{
-			Device:       p.Device,
-			Mountpoint:   p.Mountpoint,
-			Fstype:       p.Fstype,
-			TotalBytes:   usage.Total,
-			UsedBytes:    usage.Used,
-			FreeBytes:    usage.Free,
-			UsagePercent: usage.UsedPercent,
-		})
+	// Snapshot current I/O counters (keyed by kernel device name, e.g. "xvda2").
+	now := time.Now()
+	ioCounters, _ := disk.IOCountersWithContext(ctx) // errors are non-fatal
+
+	m.mu.Lock()
+	prev := m.prevIO
+	prevAt := m.prevIOAt
+	m.prevIO = ioCounters
+	m.prevIOAt = now
+	m.mu.Unlock()
+
+	var elapsed float64
+	if !prevAt.IsZero() {
+		elapsed = now.Sub(prevAt).Seconds()
 	}
 
-	return &DiskStats{Partitions: stats}, nil
+	var entries []DiskEntry
+	for _, p := range partitions {
+		if pseudoFS[p.Fstype] {
+			continue
+		}
+		usage, err := disk.UsageWithContext(ctx, p.Mountpoint)
+		if err != nil {
+			continue
+		}
+
+		entry := DiskEntry{
+			Device:     p.Device,
+			Mountpoint: p.Mountpoint,
+			TotalBytes: usage.Total,
+			UsedBytes:  usage.Used,
+			UsagePct:   usage.UsedPercent,
+		}
+
+		// Attach IO rates when we have a previous baseline and counters.
+		if elapsed > 0 && prev != nil && ioCounters != nil {
+			// gopsutil keys by kernel name (strip /dev/ prefix).
+			devName := strings.TrimPrefix(p.Device, "/dev/")
+			if cur, ok := ioCounters[devName]; ok {
+				if old, ok := prev[devName]; ok {
+					elapsedMs := elapsed * 1000
+					utilPct := 0.0
+					if elapsedMs > 0 {
+						utilPct = float64(cur.IoTime-old.IoTime) / elapsedMs * 100
+						if utilPct > 100 {
+							utilPct = 100
+						}
+					}
+					entry.IO = &DiskIO{
+						ReadBytesPerS:  float64(cur.ReadBytes-old.ReadBytes) / elapsed,
+						WriteBytesPerS: float64(cur.WriteBytes-old.WriteBytes) / elapsed,
+						ReadIOPS:       float64(cur.ReadCount-old.ReadCount) / elapsed,
+						WriteIOPS:      float64(cur.WriteCount-old.WriteCount) / elapsed,
+						UtilPct:        utilPct,
+					}
+				}
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
 }
 
-// GetNetwork returns I/O counters and address information for all interfaces.
-func (m *Module) GetNetwork(ctx context.Context) (*NetworkStats, error) {
+// isVirtualInterface reports whether the interface name should be excluded
+// from telemetry (loopback, Docker bridges, veth pairs, libvirt bridges).
+func isVirtualInterface(name string) bool {
+	return name == "lo" ||
+		strings.HasPrefix(name, "docker") ||
+		strings.HasPrefix(name, "veth") ||
+		strings.HasPrefix(name, "br-") ||
+		strings.HasPrefix(name, "virbr") ||
+		strings.HasPrefix(name, "vlan")
+}
+
+// GetNetwork returns I/O counters for physical/relevant interfaces only.
+func (m *Module) GetNetwork(ctx context.Context) ([]NetworkEntry, error) {
 	counters, err := gopsnet.IOCountersWithContext(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("net.IOCounters: %w", err)
@@ -190,38 +249,34 @@ func (m *Module) GetNetwork(ctx context.Context) (*NetworkStats, error) {
 		return nil, fmt.Errorf("net.Interfaces: %w", err)
 	}
 
-	// Build a map from interface name → gopsutil interface for address lookup.
 	ifaceMap := make(map[string]gopsnet.InterfaceStat, len(ifaces))
 	for _, iface := range ifaces {
 		ifaceMap[iface.Name] = iface
 	}
 
-	var interfaces []InterfaceStats
+	var entries []NetworkEntry
 	for _, c := range counters {
-		iface := InterfaceStats{
-			Name:        c.Name,
-			BytesSent:   c.BytesSent,
-			BytesRecv:   c.BytesRecv,
-			PacketsSent: c.PacketsSent,
-			PacketsRecv: c.PacketsRecv,
+		if isVirtualInterface(c.Name) {
+			continue
+		}
+
+		entry := NetworkEntry{
+			Interface: c.Name,
+			BytesSent: c.BytesSent,
+			BytesRecv: c.BytesRecv,
 		}
 
 		if netIface, ok := ifaceMap[c.Name]; ok {
-			// Check if the interface is up by looking for the "up" flag.
 			for _, flag := range netIface.Flags {
 				if flag == "up" {
-					iface.IsUp = true
+					entry.IsUp = true
 					break
 				}
 			}
-			// Collect all assigned IP addresses.
-			for _, addr := range netIface.Addrs {
-				iface.IPAddresses = append(iface.IPAddresses, addr.Addr)
-			}
 		}
 
-		interfaces = append(interfaces, iface)
+		entries = append(entries, entry)
 	}
 
-	return &NetworkStats{Interfaces: interfaces}, nil
+	return entries, nil
 }

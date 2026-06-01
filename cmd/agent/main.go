@@ -1,30 +1,27 @@
 // Command plusclouds-agent is the PlusClouds VM agent daemon.
-// It collects system metrics, manages systemd services, exposes a REST and
-// gRPC API, and maintains a heartbeat connection with the PlusClouds control
-// plane.
+// It collects system metrics, manages services, and communicates with the
+// PlusClouds platform exclusively via NATS. Supports Linux and Windows.
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
-	"github.com/coreos/go-systemd/v22/dbus"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/plusclouds/ubuntu-agent/internal/api/grpc"
-	agenthttp "github.com/plusclouds/ubuntu-agent/internal/api/http"
-	"github.com/plusclouds/ubuntu-agent/internal/api/http/response"
 	"github.com/plusclouds/ubuntu-agent/internal/config"
-	"github.com/plusclouds/ubuntu-agent/internal/modules/services"
+	"github.com/plusclouds/ubuntu-agent/internal/dispatcher"
+	"github.com/plusclouds/ubuntu-agent/internal/executor"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
-	"github.com/plusclouds/ubuntu-agent/internal/registry"
-	"github.com/plusclouds/ubuntu-agent/internal/telemetry"
+	natsclient "github.com/plusclouds/ubuntu-agent/internal/nats"
+	"github.com/plusclouds/ubuntu-agent/internal/protocol"
+	"github.com/plusclouds/ubuntu-agent/internal/publisher"
 	"github.com/plusclouds/ubuntu-agent/pkg/isoconfig"
 )
 
@@ -33,7 +30,7 @@ var cfgFile string
 func main() {
 	root := &cobra.Command{
 		Use:     "plusclouds-agent",
-		Short:   "PlusClouds Ubuntu VM Agent",
+		Short:   "PlusClouds VM Agent",
 		Version: config.AgentVersion,
 		RunE:    run,
 	}
@@ -47,7 +44,7 @@ func main() {
 	}
 }
 
-func run(cmd *cobra.Command, _ []string) error {
+func run(_ *cobra.Command, _ []string) error {
 	// ------------------------------------------------------------------ //
 	// 1. Load configuration
 	// ------------------------------------------------------------------ //
@@ -57,7 +54,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	}
 
 	// ------------------------------------------------------------------ //
-	// 2. Initialise zap logger
+	// 2. Initialise logger
 	// ------------------------------------------------------------------ //
 	logger, err := buildLogger(cfg)
 	if err != nil {
@@ -71,115 +68,103 @@ func run(cmd *cobra.Command, _ []string) error {
 	)
 
 	// ------------------------------------------------------------------ //
-	// 3. Read ISO metadata
+	// 3. Resolve identity — config file is primary; ISO overrides if mounted.
 	// ------------------------------------------------------------------ //
+	agentUUID := cfg.NATS.AgentUUID
+	agentAPIKey := cfg.NATS.APIKey
+
 	isoReader := isoconfig.NewReader(cfg.ISO.MountPath)
 	iso, err := isoReader.Read()
 	if err != nil {
-		logger.Warn("could not read ISO config drive; running in local-only mode",
+		logger.Debug("ISO config drive not available (expected in production)",
 			zap.String("mount_path", cfg.ISO.MountPath),
 			zap.Error(err),
 		)
 		iso = &isoconfig.ISOMetadata{}
-	} else {
-		logger.Info("ISO metadata loaded",
+	} else if iso.VMID() != "" {
+		logger.Debug("ISO config drive found, overriding agent identity",
 			zap.String("vm_id", iso.VMID()),
-			zap.String("tenant_id", iso.TenantID()),
 		)
+		agentUUID = iso.VMID()
+		agentAPIKey = iso.AgentAPIKey()
 	}
 
-	// Merge ISO credentials into config (ISO takes precedence over config file).
-	if iso.APIKey() != "" {
-		cfg.Auth.APIKey = iso.APIKey()
+	if agentUUID == "" {
+		logger.Warn("agent_uuid is not set — NATS auth will fail; set nats.agent_uuid in agent.yaml")
 	}
-	if iso.ControlPlaneURL() != "" {
-		cfg.Registry.Endpoint = iso.ControlPlaneURL()
+	if agentAPIKey == "" {
+		logger.Warn("api_key is not set — NATS auth will fail; set nats.api_key in agent.yaml")
 	}
 
-	// Set agent ID for API response metadata.
-	response.SetAgentID(iso.VMID())
+	logger.Info("agent identity resolved", zap.String("agent_uuid", agentUUID))
 
 	// ------------------------------------------------------------------ //
-	// 4. Connect to systemd D-Bus
+	// 4. Initialise platform-specific service manager
 	// ------------------------------------------------------------------ //
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var dbusConn *dbus.Conn
-	dbusConn, err = dbus.NewSystemdConnectionContext(ctx)
-	if err != nil {
-		logger.Warn("could not connect to systemd D-Bus; service management will be unavailable",
-			zap.Error(err),
-		)
-	} else {
-		defer dbusConn.Close()
-		logger.Info("connected to systemd D-Bus")
-	}
+	svcMgr, svcCleanup := newServiceManager(ctx, logger)
+	defer svcCleanup()
 
 	// ------------------------------------------------------------------ //
-	// 5. Initialise modules
+	// 5. Initialise remaining modules
 	// ------------------------------------------------------------------ //
 	sysMod := system.New(iso)
-	svcMod := services.New(dbusConn, logger) // dbusConn may be nil in dev/non-root mode
-	logger.Info("system and services modules initialised")
+	exec := executor.New(logger)
+	logger.Info("modules initialised",
+		zap.Int("allowed_operations", len(cfg.Agent.AllowedOperations)),
+		zap.Int("allowed_commands", len(cfg.Agent.AllowedCommands)),
+		zap.Duration("telemetry_interval", cfg.Agent.TelemetryInterval),
+		zap.Duration("heartbeat_interval", cfg.Agent.HeartbeatInterval),
+	)
 
 	// ------------------------------------------------------------------ //
-	// 6. Register with the PlusClouds orchestrator  ← MANDATORY GATE
-	//
-	// The agent reads the AgentToken from the ISO config drive and presents
-	// it to the orchestrator. The orchestrator validates the token, records
-	// the agent in its inventory, and returns a SessionToken.
-	//
-	// No HTTP or gRPC server is started until this succeeds. If the control
-	// plane endpoint is not configured the agent runs in local-only mode
-	// (ErrNoControlPlane). Any other error is fatal.
+	// 6. Connect to NATS
 	// ------------------------------------------------------------------ //
-	reg := registry.New(cfg, iso, sysMod, logger)
-	if err := reg.Register(ctx); err != nil {
-		if errors.Is(err, registry.ErrNoControlPlane) {
-			logger.Warn("no orchestrator endpoint configured — starting in local-only mode")
-		} else {
-			// Hard failure: stop here, do not expose any API.
-			return fmt.Errorf("orchestrator registration failed: %w", err)
-		}
+	nc, err := natsclient.Connect(cfg.NATS, agentUUID, agentAPIKey, logger)
+	if err != nil {
+		return fmt.Errorf("NATS connection failed: %w", err)
 	}
-	reg.StartHeartbeat(ctx)
+	defer nc.Drain()
 
 	// ------------------------------------------------------------------ //
-	// 7. Initialise telemetry
+	// 7. Create publisher and dispatcher
 	// ------------------------------------------------------------------ //
-	telemetry.Register()
-	logger.Info("Prometheus metrics registered")
+	pub := publisher.New(nc, sysMod, agentUUID, cfg.Agent, logger)
+
+	disp := dispatcher.New(
+		sysMod, svcMgr, exec, pub,
+		agentUUID,
+		cfg.Agent.AllowedOperations,
+		cfg.Agent.AllowedCommands,
+		logger,
+	)
 
 	// ------------------------------------------------------------------ //
-	// 8. Build HTTP router and start HTTP server
+	// 8. Subscribe to cmd subject
 	// ------------------------------------------------------------------ //
-	router := agenthttp.NewRouter(cfg.Auth.APIKey, sysMod, svcMod, iso, logger)
-	httpServer := agenthttp.New(cfg, router, logger)
-
-	httpErrCh := make(chan error, 1)
-	go func() {
-		if err := httpServer.Start(ctx); err != nil {
-			httpErrCh <- err
+	if err := nc.Subscribe(func(env protocol.Envelope) {
+		result := disp.Dispatch(ctx, env)
+		if err := nc.Publish(result); err != nil {
+			logger.Error("could not publish result to evt subject",
+				zap.String("command_id", env.ID),
+				zap.Error(err),
+			)
 		}
-		close(httpErrCh)
-	}()
+	}); err != nil {
+		return fmt.Errorf("subscribing to NATS cmd subject: %w", err)
+	}
 
 	// ------------------------------------------------------------------ //
-	// 9. Start gRPC server
+	// 9. Start heartbeat and telemetry publisher
 	// ------------------------------------------------------------------ //
-	grpcServer := grpc.New(cfg, logger)
-	grpcErrCh := make(chan error, 1)
-	go func() {
-		if err := grpcServer.Start(ctx); err != nil {
-			grpcErrCh <- err
-		}
-		close(grpcErrCh)
-	}()
+	pub.Start(ctx)
 
 	logger.Info("agent started",
-		zap.Int("http_port", cfg.Server.HTTP.Port),
-		zap.Int("grpc_port", cfg.Server.GRPC.Port),
+		zap.String("nats_url", cfg.NATS.ActiveURL()),
+		zap.String("cmd_subject", nc.CmdSubject()),
+		zap.String("evt_subject", nc.EvtSubject()),
 	)
 
 	// ------------------------------------------------------------------ //
@@ -187,53 +172,47 @@ func run(cmd *cobra.Command, _ []string) error {
 	// ------------------------------------------------------------------ //
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logger.Info("received shutdown signal", zap.String("signal", sig.String()))
 
-	select {
-	case sig := <-sigCh:
-		logger.Info("received shutdown signal", zap.String("signal", sig.String()))
-	case err := <-httpErrCh:
-		if err != nil {
-			logger.Error("HTTP server error", zap.Error(err))
-		}
-	case err := <-grpcErrCh:
-		if err != nil {
-			logger.Error("gRPC server error", zap.Error(err))
-		}
-	}
-
-	// ------------------------------------------------------------------ //
-	// 11. Graceful shutdown
-	// ------------------------------------------------------------------ //
 	logger.Info("initiating graceful shutdown")
-	cancel() // signal all goroutines to stop
-
-	// Wait for servers to drain.
-	if err := <-httpErrCh; err != nil {
-		logger.Warn("HTTP server shutdown error", zap.Error(err))
-	}
-	if err := <-grpcErrCh; err != nil {
-		logger.Warn("gRPC server shutdown error", zap.Error(err))
-	}
-
-	// D-Bus connection is closed by the deferred dbusConn.Close() above.
+	cancel()
 	logger.Info("agent stopped cleanly")
 	return nil
 }
 
-// buildLogger constructs a zap logger from the configuration.
 func buildLogger(cfg *config.Config) (*zap.Logger, error) {
 	var level zapcore.Level
 	if err := level.UnmarshalText([]byte(cfg.Log.Level)); err != nil {
 		level = zapcore.InfoLevel
 	}
 
-	var zapCfg zap.Config
-	if cfg.Log.Format == "console" {
-		zapCfg = zap.NewDevelopmentConfig()
-	} else {
-		zapCfg = zap.NewProductionConfig()
-	}
-	zapCfg.Level = zap.NewAtomicLevelAt(level)
+	encCfg := zap.NewProductionEncoderConfig()
+	encCfg.TimeKey = "ts"
+	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 
-	return zapCfg.Build()
+	var stdoutEnc zapcore.Encoder
+	if cfg.Log.Format == "console" {
+		consoleEncCfg := zap.NewDevelopmentEncoderConfig()
+		consoleEncCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+		stdoutEnc = zapcore.NewConsoleEncoder(consoleEncCfg)
+	} else {
+		stdoutEnc = zapcore.NewJSONEncoder(encCfg)
+	}
+	stdoutCore := zapcore.NewCore(stdoutEnc, zapcore.AddSync(os.Stdout), level)
+	cores := []zapcore.Core{stdoutCore}
+
+	if cfg.Log.File != "" {
+		if err := os.MkdirAll(filepath.Dir(cfg.Log.File), 0755); err != nil {
+			return nil, fmt.Errorf("creating log directory: %w", err)
+		}
+		f, err := os.OpenFile(cfg.Log.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("opening log file %s: %w", cfg.Log.File, err)
+		}
+		fileCore := zapcore.NewCore(zapcore.NewJSONEncoder(encCfg), zapcore.AddSync(f), level)
+		cores = append(cores, fileCore)
+	}
+
+	return zap.New(zapcore.NewTee(cores...), zap.AddCaller()), nil
 }

@@ -1,47 +1,86 @@
-# PlusClouds Agent Configuration
-# This file contains defaults; values are overridden by environment variables
-# (prefix: PLUSCLOUDS_AGENT_) and by the ISO config drive credentials.
+# PlusClouds Agent v2 Configuration
+#
+# This file is the primary source of identity for the agent. In production it
+# is written by the platform during VM provisioning (via the ISO config drive)
+# and the ISO is unmounted before the agent starts. All values here can also be
+# overridden by environment variables (prefix: PLUSCLOUDS_AGENT_).
 
-server:
-  http:
-    # Port for the REST API server
-    port: 8080
-  grpc:
-    # Port for the gRPC server
-    port: 8081
-  telemetry:
-    # Port for Prometheus metrics scraping
-    port: 9100
+nats:
+  # Transport: "nats" (TCP) or "websocket" (wss://, no client certificates needed).
+  connection_type: websocket
 
-auth:
-  # API key used to authenticate requests to this agent.
-  # Populated automatically from the ISO config drive (credentials.json).
-  # Can also be set via PLUSCLOUDS_AGENT_AUTH_API_KEY environment variable.
-  api_key: ""
+  # Used when connection_type is "nats".
+  url: nats://nats.plusclouds.com:4222
+
+  # Used when connection_type is "websocket".
+  websocket_url: wss://nats.plusclouds.com:443
+
+  # VM UUID — written here by the platform during provisioning.
+  # Used as the NATS username for authentication.
+  # Override via env: PLUSCLOUDS_AGENT_NATS_AGENT_UUID
+  agent_uuid: "3caa8787-c68e-45d9-923e-c378c10634c8"
+
+  # Agent API key — written here by the platform during provisioning.
+  # Used as the NATS password for authentication.
+  # Override via env: PLUSCLOUDS_AGENT_NATS_API_KEY
+  api_key: "3jx4FADBXloSstiTrL1mGIuKgieSjvdB57Gn1JKmphbCvZWpAr06tG8lX4QsUigr"
+
+  # -1 = unlimited reconnect attempts
+  max_reconnects: -1
+  reconnect_wait: 5s
+
+agent:
+  heartbeat_interval: 30s
+  telemetry_interval: 30s
+
+  # Operations this agent is permitted to execute.
+  # Remove any entry to disable that operation — the platform will receive a
+  # "rejected" result instead of being able to run it.
+  allowed_operations:
+    - agent.allowed_operations
+    - services.list
+    - services.get
+    - services.start
+    - services.stop
+    - services.restart
+    - services.reload
+    - services.enable
+    - services.disable
+    - system.info
+    - system.metrics
+    - system.cpu
+    - system.memory
+    - system.disk
+    - system.network
+    - system.update
+    - telemetry.set_interval
+    # Uncomment to allow arbitrary command execution (see allowed_commands below)
+    # - exec
+    # - vm.reboot
+    # - vm.shutdown
+
+  # When "exec" is listed above, only these exact binary paths may be invoked.
+  # Requests referencing unlisted paths are rejected.
+  allowed_commands:
+    - /usr/bin/journalctl
+    - /usr/bin/df
+    - /usr/bin/free
 
 iso:
-  # Path where the PlusClouds config drive ISO is mounted.
+  # Mount path checked at startup. In production the ISO is unmounted before
+  # the agent starts, so this is a silent best-effort check. If the ISO is
+  # present and carries a vm_id, it overrides the values above.
   mount_path: /media/plusclouds-config
-  # If true, fall back to environment variables when ISO files are not present.
-  # Useful for local development without an ISO.
-  fallback_env: true
-
-registry:
-  # PlusClouds control plane endpoint for registration and heartbeats.
-  # Populated automatically from the ISO config drive (credentials.json).
-  # Example: https://api.plusclouds.com
-  endpoint: ""
-  # How often the agent sends a heartbeat to the control plane.
-  heartbeat_interval: 30s
 
 log:
   # Log level: debug, info, warn, error
-  level: info
-  # Log format: json or console
-  format: json
+  level: debug
+  # Log format for stdout: json or console
+  format: console
+  # Optional path to write logs to in addition to stdout (always JSON).
+  # Directory is created automatically. Leave empty to disable.
+  file: /var/log/plusclouds/agent.log
 
 autoheal:
-  # Enable automatic service restart on failure detection.
   enabled: true
-  # How long to wait before restarting a failed service.
   restart_delay: 10s

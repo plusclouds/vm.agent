@@ -1,5 +1,7 @@
 // Command plsctl is the PlusClouds agent CLI client.
-// It communicates with a running plusclouds-agent instance over HTTP.
+// NOTE: This tool was designed for the v1 REST API. The REST API was removed
+// in v2 (replaced by NATS). Commands will fail at runtime with a connection
+// error; the tool is preserved for future re-implementation.
 package main
 
 import (
@@ -22,9 +24,9 @@ import (
 
 // Global flags.
 var (
-	baseURL    string
-	apiKey     string
-	outputFmt  string
+	baseURL   string
+	apiKey    string
+	outputFmt string
 )
 
 // apiResponse mirrors the agent's standard Response envelope.
@@ -58,7 +60,6 @@ func buildRootCmd() *cobra.Command {
 	root.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table",
 		"Output format: table, json")
 
-	// Allow environment variable overrides for flags.
 	if u := os.Getenv("PLSCTL_URL"); u != "" && baseURL == "http://localhost:8080" {
 		baseURL = u
 	}
@@ -115,7 +116,6 @@ func buildSystemCmd() *cobra.Command {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				return fetchAndPrint[system.SystemMetrics]("/api/v1/system/metrics",
 					func(v *system.SystemMetrics) {
-						fmt.Printf("Collected at: %s\n\n", time.Unix(v.CollectedAt, 0).Format(time.RFC3339))
 						printCPU(&v.CPU)
 						printMemory(&v.Memory)
 					})
@@ -141,22 +141,20 @@ func buildSystemCmd() *cobra.Command {
 			Use:   "disk",
 			Short: "Show disk usage per partition",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return fetchAndPrint[system.DiskStats]("/api/v1/system/disk",
-					func(v *system.DiskStats) {
-						rows := make([][]string, 0, len(v.Partitions))
-						for _, p := range v.Partitions {
+				return fetchAndPrint[[]system.DiskEntry]("/api/v1/system/disk",
+					func(v *[]system.DiskEntry) {
+						rows := make([][]string, 0, len(*v))
+						for _, p := range *v {
 							rows = append(rows, []string{
 								p.Device,
 								p.Mountpoint,
-								p.Fstype,
 								formatBytes(p.TotalBytes),
 								formatBytes(p.UsedBytes),
-								formatBytes(p.FreeBytes),
-								fmt.Sprintf("%.1f%%", p.UsagePercent),
+								fmt.Sprintf("%.1f%%", p.UsagePct),
 							})
 						}
 						cmdutil.PrintTable(
-							[]string{"Device", "Mountpoint", "FS", "Total", "Used", "Free", "Use%"},
+							[]string{"Device", "Mountpoint", "Total", "Used", "Use%"},
 							rows,
 						)
 					})
@@ -166,24 +164,23 @@ func buildSystemCmd() *cobra.Command {
 			Use:   "network",
 			Short: "Show network interface statistics",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return fetchAndPrint[system.NetworkStats]("/api/v1/system/network",
-					func(v *system.NetworkStats) {
-						rows := make([][]string, 0, len(v.Interfaces))
-						for _, iface := range v.Interfaces {
+				return fetchAndPrint[[]system.NetworkEntry]("/api/v1/system/network",
+					func(v *[]system.NetworkEntry) {
+						rows := make([][]string, 0, len(*v))
+						for _, iface := range *v {
 							up := "no"
 							if iface.IsUp {
 								up = "yes"
 							}
 							rows = append(rows, []string{
-								iface.Name,
-								strings.Join(iface.IPAddresses, ", "),
+								iface.Interface,
 								formatBytes(iface.BytesRecv),
 								formatBytes(iface.BytesSent),
 								up,
 							})
 						}
 						cmdutil.PrintTable(
-							[]string{"Interface", "IP Addresses", "Bytes Recv", "Bytes Sent", "Up"},
+							[]string{"Interface", "Bytes Recv", "Bytes Sent", "Up"},
 							rows,
 						)
 					})
@@ -266,7 +263,6 @@ func buildServiceCmd() *cobra.Command {
 	return cmd
 }
 
-// buildServiceActionCmd creates a cobra.Command for a POST service action.
 func buildServiceActionCmd(action, short string) *cobra.Command {
 	return &cobra.Command{
 		Use:   action + " <name>",
@@ -367,8 +363,6 @@ func withMethod(method string) requestOption {
 	return func(o *requestOptions) { o.method = method }
 }
 
-// doRequest performs an HTTP request to the agent API and returns the parsed
-// apiResponse. It applies the global baseURL, apiKey, and output format.
 func doRequest(path string, opts ...requestOption) (*apiResponse, error) {
 	o := &requestOptions{method: http.MethodGet}
 	for _, opt := range opts {
@@ -398,7 +392,6 @@ func doRequest(path string, opts ...requestOption) (*apiResponse, error) {
 
 	var ar apiResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
-		// Return raw body on non-JSON responses (e.g. plaintext errors).
 		return nil, fmt.Errorf("parsing response (status %d): %w\n%s", resp.StatusCode, err, body)
 	}
 
@@ -409,9 +402,6 @@ func doRequest(path string, opts ...requestOption) (*apiResponse, error) {
 	return &ar, nil
 }
 
-// fetchAndPrint is a generic helper that fetches a typed API response and
-// calls the provided table printer (unless the user requested JSON output,
-// in which case the raw JSON is printed).
 func fetchAndPrint[T any](path string, tablePrinter func(*T), opts ...requestOption) error {
 	ar, err := doRequest(path, opts...)
 	if err != nil {
@@ -419,32 +409,26 @@ func fetchAndPrint[T any](path string, tablePrinter func(*T), opts ...requestOpt
 		return err
 	}
 
-	if outputFmt == "json" {
-		var v T
-		if err := json.Unmarshal(ar.Data, &v); err != nil {
-			return fmt.Errorf("parsing data: %w", err)
-		}
-		cmdutil.PrintJSON(v)
-		return nil
-	}
-
 	var v T
 	if err := json.Unmarshal(ar.Data, &v); err != nil {
 		return fmt.Errorf("parsing data: %w", err)
 	}
+
+	if outputFmt == "json" {
+		cmdutil.PrintJSON(v)
+		return nil
+	}
+
 	tablePrinter(&v)
 	return nil
 }
 
-// fetchRawAndPrint fetches the raw JSON payload and prints it regardless of
-// output format.
 func fetchRawAndPrint(path string, opts ...requestOption) error {
 	ar, err := doRequest(path, opts...)
 	if err != nil {
 		cmdutil.PrintError(err.Error())
 		return err
 	}
-	// Pretty-print the data field.
 	var v interface{}
 	if err := json.Unmarshal(ar.Data, &v); err != nil {
 		fmt.Println(string(ar.Data))
@@ -486,12 +470,11 @@ func printCPU(v *system.CPUStats) {
 	cmdutil.PrintTable(
 		[]string{"Field", "Value"},
 		[][]string{
-			{"CPU Model", v.ModelName},
 			{"Core Count", strconv.Itoa(v.CoreCount)},
-			{"Usage", fmt.Sprintf("%.1f%%", v.UsagePercent)},
-			{"Load Avg 1m", fmt.Sprintf("%.2f", v.LoadAvg1)},
-			{"Load Avg 5m", fmt.Sprintf("%.2f", v.LoadAvg5)},
-			{"Load Avg 15m", fmt.Sprintf("%.2f", v.LoadAvg15)},
+			{"Usage", fmt.Sprintf("%.1f%%", v.UsagePct)},
+			{"Load Avg 1m", fmt.Sprintf("%.2f", v.LoadAvg[0])},
+			{"Load Avg 5m", fmt.Sprintf("%.2f", v.LoadAvg[1])},
+			{"Load Avg 15m", fmt.Sprintf("%.2f", v.LoadAvg[2])},
 		},
 	)
 }
@@ -502,10 +485,7 @@ func printMemory(v *system.MemoryStats) {
 		[][]string{
 			{"Total RAM", formatBytes(v.TotalBytes)},
 			{"Used RAM", formatBytes(v.UsedBytes)},
-			{"Free RAM", formatBytes(v.FreeBytes)},
-			{"RAM Usage", fmt.Sprintf("%.1f%%", v.UsagePercent)},
-			{"Swap Total", formatBytes(v.SwapTotal)},
-			{"Swap Used", formatBytes(v.SwapUsed)},
+			{"RAM Usage", fmt.Sprintf("%.1f%%", v.UsagePct)},
 		},
 	)
 }

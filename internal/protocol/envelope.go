@@ -36,6 +36,10 @@ type Envelope struct {
 	AgentType string          `json:"agent_type"`
 	AgentUUID string          `json:"agent_uuid"`
 	Timestamp int64           `json:"timestamp"`
+	// ReplyTo is set by the platform on sync commands (AgentCommandService::send).
+	// The agent publishes the result directly to this inbox subject instead of
+	// the evt subject. Absent on all other messages.
+	ReplyTo   string          `json:"reply_to,omitempty"`
 	Payload   json.RawMessage `json:"payload"`
 }
 

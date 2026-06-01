@@ -14,7 +14,7 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/protocol"
 )
 
-const minTelemetryInterval = 5 * time.Second
+const minTelemetryInterval = 1 * time.Second
 
 // Publisher publishes periodic events (heartbeat, telemetry) to the platform.
 type Publisher struct {
@@ -230,7 +230,7 @@ var operationCatalog = map[string]protocol.OperationSchema{
 		Description: "Change the telemetry push interval at runtime. Minimum 5 seconds.",
 		Params: []protocol.OperationParam{
 			{Name: "interval_s", Type: "integer", Required: true,
-				Description: "New telemetry interval in seconds.", MinValue: intPtr(5)},
+				Description: "New telemetry interval in seconds.", MinValue: intPtr(1)},
 		},
 	},
 	"vm.reboot": {

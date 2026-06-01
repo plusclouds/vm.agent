@@ -18,12 +18,12 @@ nats:
   # VM UUID — written here by the platform during provisioning.
   # Used as the NATS username for authentication.
   # Override via env: PLUSCLOUDS_AGENT_NATS_AGENT_UUID
-  agent_uuid: "3caa8787-c68e-45d9-923e-c378c10634c8"
+  agent_uuid: "d6199047-322a-4845-bdea-1d44dd1b49e5"
 
   # Agent API key — written here by the platform during provisioning.
   # Used as the NATS password for authentication.
   # Override via env: PLUSCLOUDS_AGENT_NATS_API_KEY
-  api_key: "3jx4FADBXloSstiTrL1mGIuKgieSjvdB57Gn1JKmphbCvZWpAr06tG8lX4QsUigr"
+  api_key: "7Qic72PeIToUWqdiIEcfPxwgVBuNNcLRBjGxuoGEJefeu92NTqanK72JlBeeXBJ3"
 
   # -1 = unlimited reconnect attempts
   max_reconnects: -1
@@ -55,7 +55,7 @@ agent:
     - system.update
     - telemetry.set_interval
     # Uncomment to allow arbitrary command execution (see allowed_commands below)
-    # - exec
+    - exec
     # - vm.reboot
     # - vm.shutdown
 
@@ -65,6 +65,7 @@ agent:
     - /usr/bin/journalctl
     - /usr/bin/df
     - /usr/bin/free
+    - /usr/bin/ls
 
 iso:
   # Mount path checked at startup. In production the ISO is unmounted before

@@ -146,11 +146,24 @@ func run(_ *cobra.Command, _ []string) error {
 	// ------------------------------------------------------------------ //
 	if err := nc.Subscribe(func(env protocol.Envelope) {
 		result := disp.Dispatch(ctx, env)
-		if err := nc.Publish(result); err != nil {
-			logger.Error("could not publish result to evt subject",
-				zap.String("command_id", env.ID),
-				zap.Error(err),
-			)
+
+		if env.ReplyTo != "" {
+			// Synchronous caller is blocking on this inbox — reply directly.
+			if err := nc.PublishToSubject(env.ReplyTo, result); err != nil {
+				logger.Error("could not publish sync result",
+					zap.String("command_id", env.ID),
+					zap.String("reply_to", env.ReplyTo),
+					zap.Error(err),
+				)
+			}
+		} else {
+			// Async path — result goes to the evt subject as usual.
+			if err := nc.Publish(result); err != nil {
+				logger.Error("could not publish result to evt subject",
+					zap.String("command_id", env.ID),
+					zap.Error(err),
+				)
+			}
 		}
 	}); err != nil {
 		return fmt.Errorf("subscribing to NATS cmd subject: %w", err)

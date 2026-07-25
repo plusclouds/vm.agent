@@ -243,6 +243,15 @@ func (m *ISOMetadata) DNSNameservers() []string {
 // schema and will be populated by the orchestrator in future versions.
 func (m *ISOMetadata) Tags() map[string]string { return nil }
 
+// SSHKeys returns the public keys provisioned for this VM's default user
+// (see Username), or nil if none were supplied.
+func (m *ISOMetadata) SSHKeys() []string {
+	if m == nil || m.raw == nil {
+		return nil
+	}
+	return m.raw.SSHKeys
+}
+
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------

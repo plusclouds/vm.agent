@@ -19,6 +19,7 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/dispatcher"
 	"github.com/plusclouds/ubuntu-agent/internal/executor"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/diskresize"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/sshkeys"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
 	natsclient "github.com/plusclouds/ubuntu-agent/internal/nats"
 	"github.com/plusclouds/ubuntu-agent/internal/protocol"
@@ -119,13 +120,35 @@ func run(_ *cobra.Command, _ []string) error {
 	logger.Info("agent identity resolved", zap.String("agent_uuid", agentUUID))
 
 	// ------------------------------------------------------------------ //
-	// 5. Initialise platform-specific service manager
+	// 5. Provision SSH keys from the config-drive metadata, if any were
+	//    supplied. Additive only — never removes a key that's already
+	//    there, so it can't lock anyone out.
+	// ------------------------------------------------------------------ //
+	if username, keys := iso.Username(), iso.SSHKeys(); username != "" && len(keys) > 0 {
+		result, err := sshkeys.New().Provision(username, keys)
+		if err != nil {
+			logger.Warn("could not provision SSH keys from config-drive metadata",
+				zap.String("username", username),
+				zap.Error(err),
+			)
+		} else if len(result.AddedKeys) > 0 {
+			logger.Info("provisioned SSH keys from config-drive metadata",
+				zap.String("username", username),
+				zap.String("path", result.Path),
+				zap.Int("added", len(result.AddedKeys)),
+				zap.Int("total", result.TotalKeys),
+			)
+		}
+	}
+
+	// ------------------------------------------------------------------ //
+	// 6. Initialise platform-specific service manager
 	// ------------------------------------------------------------------ //
 	svcMgr, svcCleanup := newServiceManager(ctx, logger)
 	defer svcCleanup()
 
 	// ------------------------------------------------------------------ //
-	// 6. Initialise remaining modules
+	// 7. Initialise remaining modules
 	// ------------------------------------------------------------------ //
 	sysMod := system.New(iso)
 	resizer := diskresize.New(exec, logger)
@@ -137,7 +160,7 @@ func run(_ *cobra.Command, _ []string) error {
 	)
 
 	// ------------------------------------------------------------------ //
-	// 7. Connect to NATS
+	// 8. Connect to NATS
 	// ------------------------------------------------------------------ //
 	nc, err := natsclient.Connect(cfg.NATS, agentUUID, agentAPIKey, logger)
 	if err != nil {
@@ -146,7 +169,7 @@ func run(_ *cobra.Command, _ []string) error {
 	defer nc.Drain()
 
 	// ------------------------------------------------------------------ //
-	// 8. Create publisher and dispatcher
+	// 9. Create publisher and dispatcher
 	// ------------------------------------------------------------------ //
 	pub := publisher.New(nc, sysMod, agentUUID, cfg.Agent, logger)
 
@@ -159,7 +182,7 @@ func run(_ *cobra.Command, _ []string) error {
 	)
 
 	// ------------------------------------------------------------------ //
-	// 9. Subscribe to cmd subject
+	// 10. Subscribe to cmd subject
 	// ------------------------------------------------------------------ //
 	if err := nc.Subscribe(func(env protocol.Envelope) {
 		result := disp.Dispatch(ctx, env)
@@ -187,7 +210,7 @@ func run(_ *cobra.Command, _ []string) error {
 	}
 
 	// ------------------------------------------------------------------ //
-	// 10. Start heartbeat and telemetry publisher
+	// 11. Start heartbeat and telemetry publisher
 	// ------------------------------------------------------------------ //
 	pub.Start(ctx)
 
@@ -198,7 +221,7 @@ func run(_ *cobra.Command, _ []string) error {
 	)
 
 	// ------------------------------------------------------------------ //
-	// 11. Wait for OS signal
+	// 12. Wait for OS signal
 	// ------------------------------------------------------------------ //
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

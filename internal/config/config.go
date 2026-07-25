@@ -115,8 +115,15 @@ type LogConfig struct {
 type AutohealConfig struct {
 	// Enabled activates automatic restart of failed services.
 	Enabled bool `mapstructure:"enabled"`
-	// RestartDelay is how long to wait before restarting a failed service.
+	// RestartDelay is both how often watched services are checked and the
+	// minimum time between restart attempts for the same service.
 	RestartDelay time.Duration `mapstructure:"restart_delay"`
+	// Services is the explicit list of unit names autoheal is allowed to
+	// restart. A service not listed here is never touched by autoheal, even
+	// if it's in a failed state — restarting arbitrary failed units
+	// system-wide risks restarting things that were deliberately stopped or
+	// are mid-maintenance, so watching is opt-in per service.
+	Services []string `mapstructure:"services"`
 }
 
 // Load builds the agent configuration from built-in defaults, overlaid with
@@ -203,4 +210,5 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("autoheal.enabled", true)
 	v.SetDefault("autoheal.restart_delay", 10*time.Second)
+	v.SetDefault("autoheal.services", []string{})
 }

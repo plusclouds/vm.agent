@@ -18,6 +18,7 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/config"
 	"github.com/plusclouds/ubuntu-agent/internal/dispatcher"
 	"github.com/plusclouds/ubuntu-agent/internal/executor"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/autoheal"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/diskresize"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/sshkeys"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
@@ -158,6 +159,10 @@ func run(_ *cobra.Command, _ []string) error {
 		zap.Duration("telemetry_interval", cfg.Agent.TelemetryInterval),
 		zap.Duration("heartbeat_interval", cfg.Agent.HeartbeatInterval),
 	)
+
+	if cfg.Autoheal.Enabled {
+		autoheal.New(svcMgr, cfg.Autoheal.Services, cfg.Autoheal.RestartDelay, logger).Start(ctx)
+	}
 
 	// ------------------------------------------------------------------ //
 	// 8. Connect to NATS

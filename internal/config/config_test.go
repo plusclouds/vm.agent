@@ -58,6 +58,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Autoheal.RestartDelay != 10*time.Second {
 		t.Errorf("autoheal restart_delay default: got %v, want 10s", cfg.Autoheal.RestartDelay)
 	}
+	if len(cfg.Autoheal.Services) != 0 {
+		t.Errorf("autoheal.services should default to empty, got %v", cfg.Autoheal.Services)
+	}
 }
 
 // --- Config-drive "agent" settings ---

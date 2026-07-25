@@ -248,7 +248,8 @@ Configuration is layered: **built-in defaults** → the `agent` object inside `p
     },
     "autoheal": {
       "enabled": true,
-      "restart_delay": "10s"
+      "restart_delay": "10s",
+      "services": ["nginx", "myapp"]
     }
   }
 }

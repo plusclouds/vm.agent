@@ -34,6 +34,7 @@ type psCurrentState struct {
 	Addresses   []string `json:"addresses"`
 	DNS         []string `json:"dns"`
 	MTU         int      `json:"mtu"`
+	Gateway     string   `json:"gateway"`
 }
 
 func (c *windowsConfigurer) Configure(ctx context.Context, nic isoconfig.VirtualNetworkCard) (*Result, error) {
@@ -50,7 +51,9 @@ $addrs = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4
     ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength)" })
 $dns = @((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses)
 $mtu = (Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).NlMtuBytes
-@{ adapterName = $adapter.Name; ifIndex = $adapter.ifIndex; addresses = $addrs; dns = $dns; mtu = $mtu } | ConvertTo-Json -Compress
+$defaultRoute = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+$gateway = if ($defaultRoute) { $defaultRoute.NextHop } else { "" }
+@{ adapterName = $adapter.Name; ifIndex = $adapter.ifIndex; addresses = $addrs; dns = $dns; mtu = $mtu; gateway = $gateway } | ConvertTo-Json -Compress
 `, nic.MACAddr, nic.MACAddr)
 
 	stdout, stderr, err := c.runner.Execute(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", queryScript)
@@ -66,8 +69,13 @@ $mtu = (Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4)
 	wantAddrs := buildAddresses(nic)
 	wantDNS := stripDNSCIDR(nic.Network.DNSNameservers)
 	wantMTU := nic.Network.MTU
+	wantGateway := ""
+	if nic.Network.Gateway != nil {
+		wantGateway = *nic.Network.Gateway
+	}
 
-	if sameStringSet(current.Addresses, wantAddrs) && sameStringSet(current.DNS, wantDNS) && current.MTU == wantMTU {
+	if sameStringSet(current.Addresses, wantAddrs) && sameStringSet(current.DNS, wantDNS) &&
+		current.MTU == wantMTU && current.Gateway == wantGateway {
 		return &Result{
 			MACAddr:   nic.MACAddr,
 			Interface: current.AdapterName,
@@ -90,27 +98,44 @@ $mtu = (Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4)
 }
 
 // buildMutateScript renders the PowerShell that removes any existing
-// manually-assigned IPv4 addresses on ifIndex and reapplies the desired
-// state. Only the first address gets -DefaultGateway, to avoid a "multiple
-// default gateways" error.
+// manually-assigned IPv4 addresses and routes on ifIndex and reapplies the
+// desired state.
+//
+// The gateway is deliberately never passed via New-NetIPAddress's
+// -DefaultGateway parameter: that parameter requires the gateway to be
+// within the subnet implied by the address's own prefix length, which a
+// /32 host address (the norm for this metadata schema — see
+// pkg/isoconfig's ip_list entries) never satisfies, since a /32 has no
+// "local subnet" other than itself. Setting a gateway outside the
+// interface's implied subnet fails the entire New-NetIPAddress call with
+// "DefaultGateway ... is not on the same network segment", which also
+// aborts the address assignment itself under $ErrorActionPreference =
+// "Stop". Instead, this mirrors the technique cloud-init-style Windows
+// provisioning tools (e.g. cloudbase-init) use for exactly this case: add
+// an explicit on-link host route to the gateway address (NextHop
+// "0.0.0.0" marks it directly reachable regardless of subnet membership),
+// then the default route via that gateway, as separate New-NetRoute calls.
 func buildMutateScript(ifIndex int, nic isoconfig.VirtualNetworkCard, addrs, dns []string, mtu int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "$ErrorActionPreference = \"Stop\"\n")
 	fmt.Fprintf(&b, "Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 -ErrorAction SilentlyContinue | "+
 		"Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false\n", ifIndex)
+	fmt.Fprintf(&b, "Get-NetRoute -InterfaceIndex %d -AddressFamily IPv4 -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | "+
+		"Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n", ifIndex)
 
-	for i, addr := range addrs {
+	for _, addr := range addrs {
 		ip, prefix := splitCIDR(addr)
 		if ip == "" {
 			continue
 		}
-		if i == 0 && nic.Network.Gateway != nil && *nic.Network.Gateway != "" {
-			fmt.Fprintf(&b, "New-NetIPAddress -InterfaceIndex %d -IPAddress \"%s\" -PrefixLength %s -DefaultGateway \"%s\" | Out-Null\n",
-				ifIndex, ip, prefix, *nic.Network.Gateway)
-		} else {
-			fmt.Fprintf(&b, "New-NetIPAddress -InterfaceIndex %d -IPAddress \"%s\" -PrefixLength %s | Out-Null\n",
-				ifIndex, ip, prefix)
-		}
+		fmt.Fprintf(&b, "New-NetIPAddress -InterfaceIndex %d -IPAddress \"%s\" -PrefixLength %s | Out-Null\n",
+			ifIndex, ip, prefix)
+	}
+
+	if nic.Network.Gateway != nil && *nic.Network.Gateway != "" {
+		gw := *nic.Network.Gateway
+		fmt.Fprintf(&b, "New-NetRoute -DestinationPrefix \"%s/32\" -InterfaceIndex %d -NextHop \"0.0.0.0\" -ErrorAction SilentlyContinue | Out-Null\n", gw, ifIndex)
+		fmt.Fprintf(&b, "New-NetRoute -DestinationPrefix \"0.0.0.0/0\" -InterfaceIndex %d -NextHop \"%s\" | Out-Null\n", ifIndex, gw)
 	}
 
 	if len(dns) > 0 {

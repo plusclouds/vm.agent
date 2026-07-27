@@ -45,11 +45,27 @@ func NewWithTimeout(logger *zap.Logger, timeout time.Duration) *Executor {
 // The command is always invoked directly — never via sh -c — to prevent
 // shell injection.
 func (e *Executor) Execute(ctx context.Context, command string, args ...string) (stdout string, stderr string, err error) {
+	return e.run(ctx, nil, command, args...)
+}
+
+// ExecuteWithStdin runs the given command with the provided arguments,
+// writing stdin to the child process's standard input. This exists so
+// sensitive values (e.g. a new password for chpasswd) can be passed to a
+// command without ever appearing in argv or in the audit log below, which
+// only ever records command+args, never stdin.
+func (e *Executor) ExecuteWithStdin(ctx context.Context, stdin []byte, command string, args ...string) (stdout string, stderr string, err error) {
+	return e.run(ctx, stdin, command, args...)
+}
+
+func (e *Executor) run(ctx context.Context, stdin []byte, command string, args ...string) (stdout string, stderr string, err error) {
 	// Apply timeout: if the context already has a shorter deadline, that wins.
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, command, args...)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -72,6 +88,8 @@ func (e *Executor) Execute(ctx context.Context, command string, args ...string) 
 	}
 
 	// Structured audit log — emitted for every execution regardless of outcome.
+	// Deliberately never logs stdin: this is what lets ExecuteWithStdin carry
+	// secrets safely.
 	e.logger.Info("command executed",
 		zap.String("command", command),
 		zap.Strings("args", args),

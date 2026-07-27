@@ -139,3 +139,99 @@ func TestWriteAuthorizedKeys_NoNewKeys_DoesNotRewriteFile(t *testing.T) {
 		t.Error("file was rewritten even though no new keys were added")
 	}
 }
+
+func TestRemoveAuthorizedKeysFile_RemovesKeyAndRewrites(t *testing.T) {
+	base := t.TempDir()
+	sshDir := filepath.Join(base, ".ssh")
+	uid, gid := os.Getuid(), os.Getgid()
+	key1 := "ssh-ed25519 AAAAKEY1 alice@example.com"
+	key2 := "ssh-rsa AAAAKEY2 bob@example.com"
+
+	if _, err := writeAuthorizedKeys(sshDir, []string{key1, key2}, uid, gid); err != nil {
+		t.Fatalf("seeding keys: %v", err)
+	}
+
+	result, err := removeAuthorizedKeysFile(sshDir, []string{key1}, uid, gid)
+	if err != nil {
+		t.Fatalf("removeAuthorizedKeysFile() error: %v", err)
+	}
+	if len(result.RemovedKeys) != 1 || result.TotalKeys != 1 {
+		t.Errorf("result = %+v, want 1 removed, 1 remaining", result)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(sshDir, "authorized_keys"))
+	if string(data) != key2+"\n" {
+		t.Errorf("authorized_keys = %q, want only key2", string(data))
+	}
+}
+
+func TestRemoveAuthorizedKeysFile_NonexistentFile_IsNoop(t *testing.T) {
+	base := t.TempDir()
+	sshDir := filepath.Join(base, ".ssh")
+	uid, gid := os.Getuid(), os.Getgid()
+
+	result, err := removeAuthorizedKeysFile(sshDir, []string{"ssh-ed25519 AAAAKEY1 alice"}, uid, gid)
+	if err != nil {
+		t.Fatalf("removeAuthorizedKeysFile() error: %v", err)
+	}
+	if len(result.RemovedKeys) != 0 {
+		t.Errorf("removed = %v, want none", result.RemovedKeys)
+	}
+}
+
+func TestRemoveAuthorizedKeysFile_RemoveAll_LeavesEmptyFileNotDeleted(t *testing.T) {
+	base := t.TempDir()
+	sshDir := filepath.Join(base, ".ssh")
+	uid, gid := os.Getuid(), os.Getgid()
+	key := "ssh-ed25519 AAAAKEY1 alice@example.com"
+
+	if _, err := writeAuthorizedKeys(sshDir, []string{key}, uid, gid); err != nil {
+		t.Fatalf("seeding key: %v", err)
+	}
+	if _, err := removeAuthorizedKeysFile(sshDir, []string{key}, uid, gid); err != nil {
+		t.Fatalf("removeAuthorizedKeysFile() error: %v", err)
+	}
+
+	path := filepath.Join(sshDir, "authorized_keys")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected authorized_keys to still exist (empty), got: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("expected empty file, size = %d", info.Size())
+	}
+}
+
+func TestListAuthorizedKeysFile(t *testing.T) {
+	base := t.TempDir()
+	sshDir := filepath.Join(base, ".ssh")
+	uid, gid := os.Getuid(), os.Getgid()
+	key1 := "ssh-ed25519 AAAAKEY1 alice@example.com"
+	key2 := "ssh-rsa AAAAKEY2 bob@example.com"
+
+	if _, err := writeAuthorizedKeys(sshDir, []string{key1, key2}, uid, gid); err != nil {
+		t.Fatalf("seeding keys: %v", err)
+	}
+
+	keys, err := listAuthorizedKeysFile(sshDir)
+	if err != nil {
+		t.Fatalf("listAuthorizedKeysFile() error: %v", err)
+	}
+	want := []string{"ssh-ed25519 AAAAKEY1", "ssh-rsa AAAAKEY2"}
+	if len(keys) != len(want) || keys[0] != want[0] || keys[1] != want[1] {
+		t.Errorf("listAuthorizedKeysFile() = %v, want %v", keys, want)
+	}
+}
+
+func TestListAuthorizedKeysFile_NonexistentFile_ReturnsNilNoError(t *testing.T) {
+	base := t.TempDir()
+	sshDir := filepath.Join(base, ".ssh")
+
+	keys, err := listAuthorizedKeysFile(sshDir)
+	if err != nil {
+		t.Fatalf("listAuthorizedKeysFile() error: %v", err)
+	}
+	if keys != nil {
+		t.Errorf("keys = %v, want nil", keys)
+	}
+}

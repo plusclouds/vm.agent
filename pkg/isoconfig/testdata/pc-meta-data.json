@@ -93,7 +93,12 @@
         "region": null
     },
     "ssh_keys": [],
-    "env_vars": [],
+    "env_vars": [
+        {
+            "key": "EXAMPLE_ENV_VAR",
+            "value": "example-value"
+        }
+    ],
     "tokens": [],
     "agent": {
         "nats": {
@@ -126,7 +131,10 @@
                 "system.disk",
                 "system.network",
                 "system.update",
-                "telemetry.set_interval"
+                "cron.list",
+                "telemetry.set_interval",
+                "sshkeys.list",
+                "env.list"
             ],
             "allowed_commands": [
                 "/usr/bin/journalctl",

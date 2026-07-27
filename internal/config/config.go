@@ -189,9 +189,12 @@ func setDefaults(v *viper.Viper) {
 		"system.disk",
 		"system.network",
 		"system.update",
+		"cron.list",
 		"telemetry.set_interval",
 		"vm.reboot",
 		"vm.shutdown",
+		"sshkeys.list",
+		"env.list",
 	})
 	v.SetDefault("agent.allowed_commands", []string{})
 

@@ -30,7 +30,7 @@ type VirtualMachineMetadata struct {
 	ComputePool         ComputePool          `json:"compute_pool"`
 	CloudNode           CloudNode            `json:"cloud_node"`
 	SSHKeys             []string             `json:"ssh_keys"`
-	EnvVars             []json.RawMessage    `json:"env_vars"`
+	EnvVars             []EnvVar             `json:"env_vars"`
 	Tokens              []json.RawMessage    `json:"tokens"`
 	// Agent carries the full agent runtime configuration (nats, agent,
 	// iso, log, autoheal sections) written by the platform. It replaces
@@ -81,6 +81,12 @@ type IPEntry struct {
 	ID         int    `json:"id"`
 	IPAddr     string `json:"ip_addr"`
 	IsReserved bool   `json:"is_reserved"`
+}
+
+// EnvVar is a system-wide environment variable to provision on the VM.
+type EnvVar struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 // ServiceRole describes a service role assigned to the VM by the orchestrator.
@@ -250,6 +256,24 @@ func (m *ISOMetadata) SSHKeys() []string {
 		return nil
 	}
 	return m.raw.SSHKeys
+}
+
+// VirtualNetworkCards returns the VM's network interfaces, or nil if none
+// were supplied.
+func (m *ISOMetadata) VirtualNetworkCards() []VirtualNetworkCard {
+	if m == nil || m.raw == nil {
+		return nil
+	}
+	return m.raw.VirtualNetworkCards
+}
+
+// EnvVars returns the system-wide environment variables to provision on the
+// VM, or nil if none were supplied.
+func (m *ISOMetadata) EnvVars() []EnvVar {
+	if m == nil || m.raw == nil {
+		return nil
+	}
+	return m.raw.EnvVars
 }
 
 // ---------------------------------------------------------------------------

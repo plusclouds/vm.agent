@@ -56,3 +56,46 @@ func (p *windowsProvisioner) Provision(username string, keys []string) (*Result,
 
 	return &Result{Username: username, Path: path, AddedKeys: added, TotalKeys: total}, nil
 }
+
+func (p *windowsProvisioner) Remove(username string, keys []string) (*RemoveResult, error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return nil, fmt.Errorf("looking up user %q: %w", username, err)
+	}
+
+	path := filepath.Join(u.HomeDir, ".ssh", "authorized_keys")
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &RemoveResult{Username: username, Path: path}, nil
+		}
+		return nil, fmt.Errorf("reading %q: %w", path, err)
+	}
+
+	merged, removed, total := removeAuthorizedKeys(string(existing), keys)
+
+	if len(removed) > 0 {
+		if err := os.WriteFile(path, []byte(merged), 0600); err != nil {
+			return nil, fmt.Errorf("writing %q: %w", path, err)
+		}
+	}
+
+	return &RemoveResult{Username: username, Path: path, RemovedKeys: removed, TotalKeys: total}, nil
+}
+
+func (p *windowsProvisioner) List(username string) ([]string, error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return nil, fmt.Errorf("looking up user %q: %w", username, err)
+	}
+
+	path := filepath.Join(u.HomeDir, ".ssh", "authorized_keys")
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading %q: %w", path, err)
+	}
+	return listAuthorizedKeys(string(existing)), nil
+}

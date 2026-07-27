@@ -4,13 +4,25 @@
 // package's Manager pattern.
 package diskresize
 
-import "context"
+import (
+	"context"
+	"runtime"
+)
 
 // Resizer is the OS-agnostic interface for growing a filesystem.
 // target is a mountpoint on Linux (e.g. "/") or a drive letter on Windows
 // (e.g. "C").
 type Resizer interface {
 	Resize(ctx context.Context, target string) (*Result, error)
+}
+
+// DefaultTarget returns the root/system volume to resize when no target is
+// specified: "/" on Linux, "C" on Windows.
+func DefaultTarget() string {
+	if runtime.GOOS == "windows" {
+		return "C"
+	}
+	return "/"
 }
 
 // CommandRunner matches *executor.Executor.Execute's signature, letting

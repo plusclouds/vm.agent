@@ -18,11 +18,17 @@ import (
 
 	"github.com/plusclouds/ubuntu-agent/internal/config"
 	"github.com/plusclouds/ubuntu-agent/internal/executor"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/cron"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/diskresize"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/envvars"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/identity"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/netconfig"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/services"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/sshkeys"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
 	"github.com/plusclouds/ubuntu-agent/internal/protocol"
 	"github.com/plusclouds/ubuntu-agent/internal/publisher"
+	"github.com/plusclouds/ubuntu-agent/pkg/isoconfig"
 )
 
 // Dispatcher routes command envelopes to the appropriate module method.
@@ -31,6 +37,11 @@ type Dispatcher struct {
 	svc             services.Manager
 	exec            *executor.Executor
 	resize          diskresize.Resizer
+	cron            cron.Lister
+	identity        identity.PasswordSetter
+	netcfg          netconfig.Configurer
+	sshkeys         sshkeys.Provisioner
+	env             envvars.Manager
 	pub             *publisher.Publisher
 	allowedOps      map[string]bool
 	allowedCommands []string
@@ -44,6 +55,11 @@ func New(
 	svc services.Manager,
 	exec *executor.Executor,
 	resize diskresize.Resizer,
+	cronLister cron.Lister,
+	identitySetter identity.PasswordSetter,
+	netCfg netconfig.Configurer,
+	sshProvisioner sshkeys.Provisioner,
+	env envvars.Manager,
 	pub *publisher.Publisher,
 	agentUUID string,
 	allowedOps []string,
@@ -59,6 +75,11 @@ func New(
 		svc:             svc,
 		exec:            exec,
 		resize:          resize,
+		cron:            cronLister,
+		identity:        identitySetter,
+		netcfg:          netCfg,
+		sshkeys:         sshProvisioner,
+		env:             env,
 		pub:             pub,
 		allowedOps:      ops,
 		allowedCommands: allowedCommands,
@@ -69,10 +90,16 @@ func New(
 
 // params is the common command params shape. Fields are optional depending on operation.
 type params struct {
-	Name       string   `json:"name"`
-	Command    string   `json:"command"`
-	Args       []string `json:"args"`
-	IntervalS  int      `json:"interval_s"`
+	Name      string                        `json:"name"`
+	Command   string                        `json:"command"`
+	Args      []string                      `json:"args"`
+	IntervalS int                           `json:"interval_s"`
+	Username  string                        `json:"username"`
+	Password  string                        `json:"password"`
+	Keys      []string                      `json:"keys"`
+	Network   *isoconfig.VirtualNetworkCard `json:"network"`
+	EnvKey    string                        `json:"env_key"`
+	EnvValue  string                        `json:"env_value"`
 }
 
 // Dispatch handles a single command envelope and returns the result envelope.
@@ -98,7 +125,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, env protocol.Envelope) protoc
 	d.logger.Debug("→ command params",
 		zap.String("command_id", env.ID),
 		zap.String("operation", op),
-		zap.ByteString("params", cmd.Params),
+		zap.ByteString("params", redactedParams(op, cmd.Params)),
 	)
 
 	if !d.allowedOps[op] {
@@ -193,13 +220,58 @@ func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) 
 	case "disk.resize":
 		target := p.Name
 		if target == "" {
-			if runtime.GOOS == "windows" {
-				target = "C"
-			} else {
-				target = "/"
-			}
+			target = diskresize.DefaultTarget()
 		}
 		return d.resize.Resize(ctx, target)
+
+	// ---- cron -----------------------------------------------------------
+	case "cron.list":
+		return d.cron.List(ctx)
+
+	// ---- identity -------------------------------------------------------
+	case "identity.set_password":
+		if p.Username == "" || p.Password == "" {
+			return nil, fmt.Errorf("username and password are required")
+		}
+		return d.identity.SetPassword(ctx, p.Username, p.Password)
+
+	// ---- network ----------------------------------------------------------
+	case "network.configure":
+		if p.Network == nil {
+			return nil, fmt.Errorf("network is required")
+		}
+		return d.netcfg.Configure(ctx, *p.Network)
+
+	// ---- sshkeys ----------------------------------------------------------
+	case "sshkeys.add":
+		if p.Username == "" {
+			return nil, fmt.Errorf("username is required")
+		}
+		return d.sshkeys.Provision(p.Username, p.Keys)
+	case "sshkeys.remove":
+		if p.Username == "" {
+			return nil, fmt.Errorf("username is required")
+		}
+		return d.sshkeys.Remove(p.Username, p.Keys)
+	case "sshkeys.list":
+		if p.Username == "" {
+			return nil, fmt.Errorf("username is required")
+		}
+		return d.sshkeys.List(p.Username)
+
+	// ---- env --------------------------------------------------------------
+	case "env.set":
+		if p.EnvKey == "" {
+			return nil, fmt.Errorf("env_key is required")
+		}
+		return d.env.Set(ctx, p.EnvKey, p.EnvValue)
+	case "env.unset":
+		if p.EnvKey == "" {
+			return nil, fmt.Errorf("env_key is required")
+		}
+		return d.env.Unset(ctx, p.EnvKey)
+	case "env.list":
+		return d.env.List(ctx)
 
 	// ---- vm -----------------------------------------------------------
 	case "vm.reboot":
@@ -354,4 +426,27 @@ func emptyParams(raw []byte) bool {
 		return true
 	}
 	return false
+}
+
+// redactedParams returns raw with the "password" field replaced for
+// operations that carry one, so the Debug-level params log line (which
+// otherwise dumps the full raw JSON) can never leak a plaintext password if
+// Debug logging is enabled. Falls back to omitting the field entirely if
+// raw can't be round-tripped through JSON.
+func redactedParams(op string, raw []byte) []byte {
+	if op != "identity.set_password" || len(raw) == 0 {
+		return raw
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return []byte(`{"redacted":"could not parse params for redaction"}`)
+	}
+	if _, ok := m["password"]; ok {
+		m["password"] = "***"
+	}
+	redacted, err := json.Marshal(m)
+	if err != nil {
+		return []byte(`{"redacted":"could not re-marshal redacted params"}`)
+	}
+	return redacted
 }

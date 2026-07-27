@@ -9,8 +9,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/plusclouds/ubuntu-agent/internal/config"
-	natsclient "github.com/plusclouds/ubuntu-agent/internal/nats"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
+	natsclient "github.com/plusclouds/ubuntu-agent/internal/nats"
 	"github.com/plusclouds/ubuntu-agent/internal/protocol"
 )
 
@@ -256,6 +256,67 @@ var operationCatalog = map[string]protocol.OperationSchema{
 			{Name: "command", Type: "string", Required: true, Description: "Absolute path of the binary to run. Must be in the exec_commands allowlist."},
 			{Name: "args", Type: "array", Required: false, Description: "List of arguments to pass to the binary."},
 		},
+	},
+	"cron.list": {
+		Operation:   "cron.list",
+		Description: "List scheduled cron jobs / systemd timers on the machine.",
+	},
+	"identity.set_password": {
+		Operation:   "identity.set_password",
+		Description: "Set the login password for a local OS user account.",
+		Params: []protocol.OperationParam{
+			{Name: "username", Type: "string", Required: true, Description: "OS username whose password will be changed."},
+			{Name: "password", Type: "string", Required: true, Description: "New plaintext password."},
+		},
+	},
+	"network.configure": {
+		Operation:   "network.configure",
+		Description: "Statically apply IP/netmask/gateway/DNS/MTU configuration to a network interface, matched by MAC address.",
+		Params: []protocol.OperationParam{
+			{Name: "network", Type: "object", Required: true, Description: "Network interface configuration (mac_addr, network, ip_list), matching the config-drive metadata's virtual_network_cards entry shape."},
+		},
+	},
+	"sshkeys.add": {
+		Operation:   "sshkeys.add",
+		Description: "Add SSH public keys to a user's authorized_keys file. Additive only — never removes existing keys.",
+		Params: []protocol.OperationParam{
+			{Name: "username", Type: "string", Required: true, Description: "OS username to provision keys for."},
+			{Name: "keys", Type: "array", Required: true, Description: "SSH public keys to add."},
+		},
+	},
+	"sshkeys.remove": {
+		Operation:   "sshkeys.remove",
+		Description: "Remove SSH public keys from a user's authorized_keys file, matched by key identity.",
+		Params: []protocol.OperationParam{
+			{Name: "username", Type: "string", Required: true, Description: "OS username to remove keys from."},
+			{Name: "keys", Type: "array", Required: true, Description: "SSH public keys to remove."},
+		},
+	},
+	"sshkeys.list": {
+		Operation:   "sshkeys.list",
+		Description: "List the SSH public keys currently in a user's authorized_keys file.",
+		Params: []protocol.OperationParam{
+			{Name: "username", Type: "string", Required: true, Description: "OS username to list keys for."},
+		},
+	},
+	"env.set": {
+		Operation:   "env.set",
+		Description: "Set a system-wide persistent environment variable.",
+		Params: []protocol.OperationParam{
+			{Name: "env_key", Type: "string", Required: true, Description: "Environment variable name."},
+			{Name: "env_value", Type: "string", Required: true, Description: "Environment variable value."},
+		},
+	},
+	"env.unset": {
+		Operation:   "env.unset",
+		Description: "Remove a system-wide persistent environment variable.",
+		Params: []protocol.OperationParam{
+			{Name: "env_key", Type: "string", Required: true, Description: "Environment variable name to remove."},
+		},
+	},
+	"env.list": {
+		Operation:   "env.list",
+		Description: "List all system-wide persistent environment variables.",
 	},
 }
 

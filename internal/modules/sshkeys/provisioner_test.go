@@ -128,3 +128,96 @@ func TestMergeAuthorizedKeys_NoValidKeysAtAll_ReturnsEmpty(t *testing.T) {
 		t.Errorf("got merged=%q added=%v total=%d, want all zero values", merged, added, total)
 	}
 }
+
+func TestRemoveAuthorizedKeys_RemovesByIdentityIgnoringComment(t *testing.T) {
+	existing := "ssh-ed25519 AAAAKEY1 alice@example.com\nssh-rsa AAAAKEY2 bob@example.com\n"
+	merged, removed, total := removeAuthorizedKeys(existing, []string{
+		"ssh-ed25519 AAAAKEY1 a-completely-different-comment",
+	})
+
+	if !reflect.DeepEqual(removed, []string{"ssh-ed25519 AAAAKEY1"}) {
+		t.Errorf("removed = %v, want [\"ssh-ed25519 AAAAKEY1\"]", removed)
+	}
+	if total != 1 {
+		t.Errorf("total = %d, want 1", total)
+	}
+	if merged != "ssh-rsa AAAAKEY2 bob@example.com\n" {
+		t.Errorf("merged = %q", merged)
+	}
+}
+
+func TestRemoveAuthorizedKeys_RemoveNonexistent_IsNoop(t *testing.T) {
+	existing := "ssh-ed25519 AAAAKEY1 alice@example.com\n"
+	merged, removed, total := removeAuthorizedKeys(existing, []string{"ssh-rsa AAAANOTPRESENT nobody"})
+
+	if len(removed) != 0 {
+		t.Errorf("removed = %v, want none", removed)
+	}
+	if total != 1 {
+		t.Errorf("total = %d, want 1", total)
+	}
+	if merged != existing {
+		t.Errorf("merged = %q, want unchanged %q", merged, existing)
+	}
+}
+
+func TestRemoveAuthorizedKeys_RemoveAll_LeavesEmptyResult(t *testing.T) {
+	existing := "ssh-ed25519 AAAAKEY1 alice@example.com\n"
+	merged, removed, total := removeAuthorizedKeys(existing, []string{"ssh-ed25519 AAAAKEY1 alice@example.com"})
+
+	if len(removed) != 1 {
+		t.Errorf("removed = %v, want 1 entry", removed)
+	}
+	if total != 0 {
+		t.Errorf("total = %d, want 0", total)
+	}
+	if merged != "" {
+		t.Errorf("merged = %q, want empty", merged)
+	}
+}
+
+func TestRemoveAuthorizedKeys_PreservesNonMatchingAndUnrecognizedLines(t *testing.T) {
+	existing := "# a hand-written comment\nssh-ed25519 AAAAKEY1 alice@example.com\nssh-rsa AAAAKEY2 bob@example.com\n"
+	merged, removed, total := removeAuthorizedKeys(existing, []string{"ssh-rsa AAAAKEY2 bob@example.com"})
+
+	if !reflect.DeepEqual(removed, []string{"ssh-rsa AAAAKEY2"}) {
+		t.Errorf("removed = %v", removed)
+	}
+	if total != 1 {
+		t.Errorf("total = %d, want 1", total)
+	}
+	want := "# a hand-written comment\nssh-ed25519 AAAAKEY1 alice@example.com\n"
+	if merged != want {
+		t.Errorf("merged = %q, want %q", merged, want)
+	}
+}
+
+func TestRemoveAuthorizedKeys_MalformedRemovalRequestsIgnored(t *testing.T) {
+	existing := "ssh-ed25519 AAAAKEY1 alice@example.com\n"
+	merged, removed, total := removeAuthorizedKeys(existing, []string{"not a valid key", ""})
+
+	if len(removed) != 0 {
+		t.Errorf("removed = %v, want none", removed)
+	}
+	if total != 1 {
+		t.Errorf("total = %d, want 1", total)
+	}
+	if merged != existing {
+		t.Errorf("merged = %q, want unchanged %q", merged, existing)
+	}
+}
+
+func TestListAuthorizedKeys(t *testing.T) {
+	existing := "# a comment\nssh-ed25519 AAAAKEY1 alice@example.com\nnot a key\nssh-rsa AAAAKEY2 bob@example.com\n"
+	got := listAuthorizedKeys(existing)
+	want := []string{"ssh-ed25519 AAAAKEY1", "ssh-rsa AAAAKEY2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("listAuthorizedKeys() = %v, want %v", got, want)
+	}
+}
+
+func TestListAuthorizedKeys_Empty(t *testing.T) {
+	if got := listAuthorizedKeys(""); got != nil {
+		t.Errorf("listAuthorizedKeys(\"\") = %v, want nil", got)
+	}
+}

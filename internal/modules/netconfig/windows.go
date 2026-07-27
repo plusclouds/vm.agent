@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -97,66 +98,106 @@ $gateway = if ($defaultRoute) { $defaultRoute.NextHop } else { "" }
 	}, nil
 }
 
-// buildMutateScript renders the PowerShell that disables DHCP, clears
-// whatever IPv4 addresses/routes ifIndex currently has, and reapplies the
-// desired state from scratch.
+// buildMutateScript renders a script that converts the interface from
+// DHCP (or whatever it currently has) to the desired static configuration
+// using netsh, not the newer NetTCPIP PowerShell cmdlets (New-NetIPAddress/
+// New-NetRoute).
 //
-// DHCP must be explicitly disabled first: cloud hypervisors commonly hand
-// out the VM's fixed IP via DHCP too, purely for guest-OS compatibility
-// (this metadata schema's dhcp_server field), so the interface can already
-// hold that exact address with PrefixOrigin "Dhcp" before this ever runs.
-// Only clearing "Manual"-origin addresses left that DHCP-leased address in
-// place, and New-NetIPAddress then failed to (re-)assign the same address
-// with "Instance MSFT_NetIPAddress already exists". Disabling DHCP and then
-// removing every IPv4 address on the interface — regardless of origin —
-// guarantees a clean slate before assigning exactly the desired addresses.
+// Two independent problems with the NetTCPIP cmdlets made them unusable
+// here:
 //
-// The gateway is deliberately never passed via New-NetIPAddress's
-// -DefaultGateway parameter: that parameter requires the gateway to be
-// within the subnet implied by the address's own prefix length, which a
-// /32 host address (the norm for this metadata schema — see
-// pkg/isoconfig's ip_list entries) never satisfies, since a /32 has no
-// "local subnet" other than itself. Setting a gateway outside the
-// interface's implied subnet fails the entire New-NetIPAddress call with
-// "DefaultGateway ... is not on the same network segment", which also
-// aborts the address assignment itself under $ErrorActionPreference =
-// "Stop". Instead, this mirrors the technique cloud-init-style Windows
-// provisioning tools (e.g. cloudbase-init) use for exactly this case: add
-// an explicit on-link host route to the gateway address (NextHop
-// "0.0.0.0" marks it directly reachable regardless of subnet membership),
-// then the default route via that gateway, as separate New-NetRoute calls.
+//  1. New-NetIPAddress -DefaultGateway requires the gateway to be within
+//     the subnet implied by the address's own prefix length, which a /32
+//     host address (the norm for this metadata schema — see
+//     pkg/isoconfig's ip_list entries) never satisfies, since a /32 has no
+//     "local subnet" other than itself. This failed the entire
+//     New-NetIPAddress call (including the address assignment) with
+//     "DefaultGateway ... is not on the same network segment".
+//
+//  2. Cloud hypervisors commonly hand the VM's fixed IP out via DHCP too,
+//     purely for guest-OS compatibility (this schema's dhcp_server
+//     field), so the interface can already hold the exact address we want
+//     to assign, with PrefixOrigin "Dhcp". Explicitly disabling DHCP and
+//     removing every address before re-adding it (tried first) still hit
+//     "Instance MSFT_NetIPAddress already exists" on this NIC (a XenServer
+//     PV virtual adapter) — the disable/remove/re-add sequence across
+//     three separate CIM-backed cmdlet calls isn't atomic and isn't
+//     reliable on every driver.
+//
+// `netsh interface ipv4 set address ... source=static` sidesteps both:
+// it performs the DHCP-to-static conversion as a single, decades-old,
+// broadly-compatible operation, and it does not enforce the same
+// gateway/subnet-membership validation as New-NetIPAddress — this is the
+// same reason cloud-init-style Windows provisioning tools (e.g.
+// cloudbase-init) use netsh for exactly this case.
 func buildMutateScript(ifIndex int, nic isoconfig.VirtualNetworkCard, addrs, dns []string, mtu int) string {
+	gateway := ""
+	if nic.Network.Gateway != nil {
+		gateway = *nic.Network.Gateway
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "$ErrorActionPreference = \"Stop\"\n")
-	fmt.Fprintf(&b, "Set-NetIPInterface -InterfaceIndex %d -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue\n", ifIndex)
-	fmt.Fprintf(&b, "Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 -ErrorAction SilentlyContinue | "+
-		"Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\n", ifIndex)
-	fmt.Fprintf(&b, "Get-NetRoute -InterfaceIndex %d -AddressFamily IPv4 -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | "+
-		"Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n", ifIndex)
+	fmt.Fprintf(&b, "$ifAlias = (Get-NetAdapter -InterfaceIndex %d).Name\n", ifIndex)
 
-	for _, addr := range addrs {
+	for i, addr := range addrs {
 		ip, prefix := splitCIDR(addr)
 		if ip == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "New-NetIPAddress -InterfaceIndex %d -IPAddress \"%s\" -PrefixLength %s | Out-Null\n",
-			ifIndex, ip, prefix)
+		mask := prefixToMask(prefix)
+		if i == 0 {
+			if gateway != "" {
+				fmt.Fprintf(&b, "netsh interface ipv4 set address name=\"$ifAlias\" source=static addr=%s mask=%s gateway=%s gwmetric=1\n",
+					ip, mask, gateway)
+			} else {
+				fmt.Fprintf(&b, "netsh interface ipv4 set address name=\"$ifAlias\" source=static addr=%s mask=%s\n", ip, mask)
+			}
+			fmt.Fprintf(&b, "if ($LASTEXITCODE -ne 0) { throw \"netsh set address failed with exit code $LASTEXITCODE\" }\n")
+		} else {
+			// Additional addresses beyond the first (e.g. reserved/floating
+			// IPs from ip_list) are added on top of the primary static
+			// address — netsh's "set address" only replaces the primary.
+			// Note: unlike "set address" (addr=), "add address" takes
+			// address= — a real inconsistency between the two netsh
+			// subcommands, not a typo.
+			fmt.Fprintf(&b, "netsh interface ipv4 add address name=\"$ifAlias\" address=%s mask=%s\n", ip, mask)
+		}
+	}
+	// Drop any stale secondary manual addresses from a previous run that
+	// assigned more addresses than the current desired state has (the
+	// primary swap above already handles addrs[0]).
+	fmt.Fprintf(&b, "Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 -ErrorAction SilentlyContinue | "+
+		"Where-Object { $_.PrefixOrigin -eq 'Manual' } | Select-Object -Skip %d | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\n",
+		ifIndex, len(addrs))
+
+	for i, ns := range dns {
+		if i == 0 {
+			// Unlike "set/add address" (parameter is addr=), "set/add
+			// dnsservers" takes address=.
+			fmt.Fprintf(&b, "netsh interface ipv4 set dnsservers name=\"$ifAlias\" source=static address=%s register=none\n", ns)
+		} else {
+			fmt.Fprintf(&b, "netsh interface ipv4 add dnsservers name=\"$ifAlias\" address=%s index=%d\n", ns, i+1)
+		}
 	}
 
-	if nic.Network.Gateway != nil && *nic.Network.Gateway != "" {
-		gw := *nic.Network.Gateway
-		fmt.Fprintf(&b, "New-NetRoute -DestinationPrefix \"%s/32\" -InterfaceIndex %d -NextHop \"0.0.0.0\" -ErrorAction SilentlyContinue | Out-Null\n", gw, ifIndex)
-		fmt.Fprintf(&b, "New-NetRoute -DestinationPrefix \"0.0.0.0/0\" -InterfaceIndex %d -NextHop \"%s\" | Out-Null\n", ifIndex, gw)
-	}
-
-	if len(dns) > 0 {
-		fmt.Fprintf(&b, "Set-DnsClientServerAddress -InterfaceIndex %d -ServerAddresses (%s)\n", ifIndex, quotedList(dns))
-	}
 	if mtu > 0 {
-		fmt.Fprintf(&b, "Set-NetIPInterface -InterfaceIndex %d -NlMtuBytes %d\n", ifIndex, mtu)
+		fmt.Fprintf(&b, "netsh interface ipv4 set subinterface \"$ifAlias\" mtu=%d store=persistent\n", mtu)
 	}
 
 	return b.String()
+}
+
+// prefixToMask converts a CIDR prefix length (e.g. "32") to a dotted-decimal
+// subnet mask (e.g. "255.255.255.255"), which is what netsh expects rather
+// than a bare prefix length. Falls back to /32 for anything unparseable.
+func prefixToMask(prefixLen string) string {
+	n, err := strconv.Atoi(prefixLen)
+	if err != nil || n < 0 || n > 32 {
+		n = 32
+	}
+	mask := uint32(0xffffffff) << uint32(32-n)
+	return fmt.Sprintf("%d.%d.%d.%d", byte(mask>>24), byte(mask>>16), byte(mask>>8), byte(mask))
 }
 
 // splitCIDR splits "10.0.0.1/24" into ("10.0.0.1", "24"). Returns "" for ip
@@ -167,14 +208,6 @@ func splitCIDR(addr string) (ip, prefix string) {
 		return "", ""
 	}
 	return addr[:idx], addr[idx+1:]
-}
-
-func quotedList(vals []string) string {
-	quoted := make([]string, len(vals))
-	for i, v := range vals {
-		quoted[i] = fmt.Sprintf("\"%s\"", v)
-	}
-	return strings.Join(quoted, ",")
 }
 
 // sameStringSet reports whether a and b contain the same elements,

@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
+
+	"github.com/plusclouds/ubuntu-agent/pkg/isoconfig"
 )
 
 type call struct {
@@ -108,53 +110,64 @@ func TestConfigure_GatewayUnchanged_NoChange(t *testing.T) {
 	}
 }
 
-// TestBuildMutateScript_GatewayNeverPassedToNewNetIPAddress guards against
-// regressing the bug where -DefaultGateway on New-NetIPAddress fails for
-// /32 addresses whose gateway isn't in the implied subnet — the norm for
-// this metadata schema. The gateway must only ever be applied via
-// New-NetRoute.
-func TestBuildMutateScript_GatewayNeverPassedToNewNetIPAddress(t *testing.T) {
+// TestBuildMutateScript_UsesNetshNotNewNetIPAddress guards against
+// regressing back to the NetTCPIP cmdlets (New-NetIPAddress/New-NetRoute),
+// which hit two separate bugs on real hardware: -DefaultGateway rejects any
+// gateway outside a /32 address's own (nonexistent) subnet, and the
+// disable/remove/re-add cmdlet sequence raced with a DHCP-leased address
+// on at least one XenServer PV NIC ("Instance MSFT_NetIPAddress already
+// exists"). netsh performs the DHCP-to-static conversion as a single
+// operation and doesn't enforce the same gateway/subnet validation.
+func TestBuildMutateScript_UsesNetshNotNewNetIPAddress(t *testing.T) {
 	nic := publicNIC()
 	gw := "203.0.113.1"
 	nic.Network.Gateway = &gw
 
 	script := buildMutateScript(5, nic, buildAddresses(nic), stripDNSCIDR(nic.Network.DNSNameservers), nic.Network.MTU)
 
-	if strings.Contains(script, "-DefaultGateway") {
-		t.Fatalf("script must never use -DefaultGateway on New-NetIPAddress, got:\n%s", script)
+	if strings.Contains(script, "New-NetIPAddress") || strings.Contains(script, "New-NetRoute") {
+		t.Fatalf("script must not use the NetTCPIP cmdlets, got:\n%s", script)
 	}
-	if !strings.Contains(script, `New-NetRoute -DestinationPrefix "203.0.113.1/32" -InterfaceIndex 5 -NextHop "0.0.0.0"`) {
-		t.Errorf("expected an on-link host route to the gateway, got:\n%s", script)
-	}
-	if !strings.Contains(script, `New-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceIndex 5 -NextHop "203.0.113.1"`) {
-		t.Errorf("expected a default route via the gateway, got:\n%s", script)
+	want := `netsh interface ipv4 set address name="$ifAlias" source=static addr=203.0.113.16 mask=255.255.255.255 gateway=203.0.113.1 gwmetric=1`
+	if !strings.Contains(script, want) {
+		t.Errorf("expected netsh set address with gateway, got:\n%s", script)
 	}
 }
 
-// TestBuildMutateScript_DisablesDHCPAndClearsAllAddresses guards against
-// regressing the bug where an address already present via a DHCP lease
-// (common on cloud hypervisors that hand out the VM's fixed IP via DHCP
-// too) was never cleared, because removal was filtered to PrefixOrigin
-// 'Manual' only — causing New-NetIPAddress to fail with "Instance
-// MSFT_NetIPAddress already exists".
-func TestBuildMutateScript_DisablesDHCPAndClearsAllAddresses(t *testing.T) {
-	nic := publicNIC()
-	script := buildMutateScript(4, nic, buildAddresses(nic), stripDNSCIDR(nic.Network.DNSNameservers), nic.Network.MTU)
-
-	if !strings.Contains(script, "Set-NetIPInterface -InterfaceIndex 4 -AddressFamily IPv4 -Dhcp Disabled") {
-		t.Errorf("expected DHCP to be disabled before assigning a static address, got:\n%s", script)
-	}
-	if strings.Contains(script, "PrefixOrigin") {
-		t.Errorf("address removal must not filter by PrefixOrigin — a DHCP-leased address needs clearing too, got:\n%s", script)
-	}
-}
-
-func TestBuildMutateScript_NoGateway_NoRoutesAdded(t *testing.T) {
+func TestBuildMutateScript_NoGateway_OmitsGatewayArg(t *testing.T) {
 	nic := privateNIC() // Gateway is nil
 	script := buildMutateScript(5, nic, buildAddresses(nic), stripDNSCIDR(nic.Network.DNSNameservers), nic.Network.MTU)
 
-	if strings.Contains(script, "New-NetRoute") {
-		t.Errorf("expected no route manipulation when no gateway is set, got:\n%s", script)
+	if strings.Contains(script, "gateway=") {
+		t.Errorf("expected no gateway argument when no gateway is set, got:\n%s", script)
+	}
+	if !strings.Contains(script, `netsh interface ipv4 set address name="$ifAlias" source=static addr=10.128.0.1 mask=255.255.255.255`) {
+		t.Errorf("expected a static address set without a gateway, got:\n%s", script)
+	}
+}
+
+func TestBuildMutateScript_SecondaryAddress_UsesAddNotSet(t *testing.T) {
+	nic := publicNIC()
+	nic.IPList.Data = append(nic.IPList.Data, isoconfig.IPEntry{ID: 1012, IPAddr: "203.0.113.17/32", IsReserved: true})
+
+	script := buildMutateScript(5, nic, buildAddresses(nic), stripDNSCIDR(nic.Network.DNSNameservers), nic.Network.MTU)
+
+	if !strings.Contains(script, `netsh interface ipv4 add address name="$ifAlias" address=203.0.113.17 mask=255.255.255.255`) {
+		t.Errorf("expected the second address to be added via 'add address', got:\n%s", script)
+	}
+}
+
+func TestPrefixToMask(t *testing.T) {
+	cases := map[string]string{
+		"32": "255.255.255.255",
+		"24": "255.255.255.0",
+		"16": "255.255.0.0",
+		"22": "255.255.252.0",
+	}
+	for prefix, want := range cases {
+		if got := prefixToMask(prefix); got != want {
+			t.Errorf("prefixToMask(%q) = %q, want %q", prefix, got, want)
+		}
 	}
 }
 

@@ -97,9 +97,19 @@ $gateway = if ($defaultRoute) { $defaultRoute.NextHop } else { "" }
 	}, nil
 }
 
-// buildMutateScript renders the PowerShell that removes any existing
-// manually-assigned IPv4 addresses and routes on ifIndex and reapplies the
-// desired state.
+// buildMutateScript renders the PowerShell that disables DHCP, clears
+// whatever IPv4 addresses/routes ifIndex currently has, and reapplies the
+// desired state from scratch.
+//
+// DHCP must be explicitly disabled first: cloud hypervisors commonly hand
+// out the VM's fixed IP via DHCP too, purely for guest-OS compatibility
+// (this metadata schema's dhcp_server field), so the interface can already
+// hold that exact address with PrefixOrigin "Dhcp" before this ever runs.
+// Only clearing "Manual"-origin addresses left that DHCP-leased address in
+// place, and New-NetIPAddress then failed to (re-)assign the same address
+// with "Instance MSFT_NetIPAddress already exists". Disabling DHCP and then
+// removing every IPv4 address on the interface — regardless of origin —
+// guarantees a clean slate before assigning exactly the desired addresses.
 //
 // The gateway is deliberately never passed via New-NetIPAddress's
 // -DefaultGateway parameter: that parameter requires the gateway to be
@@ -118,8 +128,9 @@ $gateway = if ($defaultRoute) { $defaultRoute.NextHop } else { "" }
 func buildMutateScript(ifIndex int, nic isoconfig.VirtualNetworkCard, addrs, dns []string, mtu int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "$ErrorActionPreference = \"Stop\"\n")
+	fmt.Fprintf(&b, "Set-NetIPInterface -InterfaceIndex %d -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue\n", ifIndex)
 	fmt.Fprintf(&b, "Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 -ErrorAction SilentlyContinue | "+
-		"Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false\n", ifIndex)
+		"Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\n", ifIndex)
 	fmt.Fprintf(&b, "Get-NetRoute -InterfaceIndex %d -AddressFamily IPv4 -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | "+
 		"Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n", ifIndex)
 

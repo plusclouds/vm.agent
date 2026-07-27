@@ -131,6 +131,24 @@ func TestBuildMutateScript_GatewayNeverPassedToNewNetIPAddress(t *testing.T) {
 	}
 }
 
+// TestBuildMutateScript_DisablesDHCPAndClearsAllAddresses guards against
+// regressing the bug where an address already present via a DHCP lease
+// (common on cloud hypervisors that hand out the VM's fixed IP via DHCP
+// too) was never cleared, because removal was filtered to PrefixOrigin
+// 'Manual' only — causing New-NetIPAddress to fail with "Instance
+// MSFT_NetIPAddress already exists".
+func TestBuildMutateScript_DisablesDHCPAndClearsAllAddresses(t *testing.T) {
+	nic := publicNIC()
+	script := buildMutateScript(4, nic, buildAddresses(nic), stripDNSCIDR(nic.Network.DNSNameservers), nic.Network.MTU)
+
+	if !strings.Contains(script, "Set-NetIPInterface -InterfaceIndex 4 -AddressFamily IPv4 -Dhcp Disabled") {
+		t.Errorf("expected DHCP to be disabled before assigning a static address, got:\n%s", script)
+	}
+	if strings.Contains(script, "PrefixOrigin") {
+		t.Errorf("address removal must not filter by PrefixOrigin — a DHCP-leased address needs clearing too, got:\n%s", script)
+	}
+}
+
 func TestBuildMutateScript_NoGateway_NoRoutesAdded(t *testing.T) {
 	nic := privateNIC() // Gateway is nil
 	script := buildMutateScript(5, nic, buildAddresses(nic), stripDNSCIDR(nic.Network.DNSNameservers), nic.Network.MTU)

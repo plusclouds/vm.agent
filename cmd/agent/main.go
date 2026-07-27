@@ -124,14 +124,19 @@ func run(ctx context.Context, cancel context.CancelFunc) error {
 
 	// ------------------------------------------------------------------ //
 	// 4. Resolve identity. The top-level config-drive identity fields
-	//    (virtual_machine_id, agent_api_key) always take precedence over
-	//    whatever the merged agent.nats settings say.
+	//    (virtual_machine_id, agent_api_key) take precedence over the
+	//    merged agent.nats settings, but independently per field — a
+	//    platform that sets virtual_machine_id at the top level but only
+	//    puts api_key under agent.nats.api_key must not have that value
+	//    clobbered by an empty top-level agent_api_key.
 	// ------------------------------------------------------------------ //
 	agentUUID := cfg.NATS.AgentUUID
 	agentAPIKey := cfg.NATS.APIKey
 
 	if iso.VMID() != "" {
 		agentUUID = iso.VMID()
+	}
+	if iso.AgentAPIKey() != "" {
 		agentAPIKey = iso.AgentAPIKey()
 	}
 

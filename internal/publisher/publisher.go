@@ -122,7 +122,7 @@ func (p *Publisher) sendHeartbeat(ctx context.Context) {
 	}
 
 	env, err := protocol.New(p.agentUUID, protocol.TypeHeartbeat, protocol.HeartbeatPayload{
-		Version: "0.2.0",
+		Version: config.AgentVersion,
 		UptimeS: info.Uptime,
 	})
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -21,6 +22,7 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/modules/autoheal"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/diskresize"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/envvars"
+	"github.com/plusclouds/ubuntu-agent/internal/modules/hostname"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/identity"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/netconfig"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/sshkeys"
@@ -159,10 +161,16 @@ func run(ctx context.Context, cancel context.CancelFunc) error {
 	netCfg := netconfig.New(exec, logger)
 	envMgr := envvars.New(logger)
 	resizer := diskresize.New(exec, logger)
+	// Renaming starts PowerShell, which at boot can take longer than the
+	// executor's default 30 seconds.
+	hostnameSetter := hostname.New(
+		executor.NewWithTimeout(logger, 2*time.Minute),
+		filepath.Join(filepath.Dir(cfg.ISO.CachePath), "hostname-applied"),
+	)
 
 	// ------------------------------------------------------------------ //
-	// 6. Apply config-drive desired state at boot: password, network,
-	//    disk resize, SSH keys, env vars. Every step here is best-effort
+	// 6. Apply config-drive desired state at boot: hostname, password,
+	//    network, disk resize, SSH keys, env vars. Every step here is best-effort
 	//    and non-fatal (log a warning and continue) — a bad NIC config or
 	//    unresolvable user must never block the agent from starting and
 	//    reaching NATS, which is the actual recovery path if boot-time
@@ -176,6 +184,23 @@ func run(ctx context.Context, cancel context.CancelFunc) error {
 	//    the platform also keeps pc-meta-data.json in sync with any live
 	//    change it issues.
 	// ------------------------------------------------------------------ //
+	// Hostname (Windows only; a no-op elsewhere). Unlike the password it is
+	// not re-asserted on every boot: see internal/modules/hostname for when
+	// a rename happens. The machine is never restarted here, so a rename
+	// takes effect at its next restart.
+	if result, err := hostnameSetter.Apply(ctx, iso.Hostname()); err != nil {
+		logger.Warn("could not apply hostname from config-drive metadata",
+			zap.String("hostname", iso.Hostname()),
+			zap.Error(err),
+		)
+	} else if result.Changed {
+		logger.Info("applied hostname from config-drive metadata",
+			zap.String("hostname", result.Hostname),
+			zap.String("previous", result.Previous),
+			zap.Bool("reboot_required", result.RebootRequired),
+		)
+	}
+
 	if username, password := iso.Username(), iso.Password(); username != "" && password != "" {
 		if _, err := identitySetter.SetPassword(ctx, username, password); err != nil {
 			logger.Warn("could not set password from config-drive metadata",

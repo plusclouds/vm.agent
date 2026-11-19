@@ -380,6 +380,7 @@ bin/plusclouds.windows  — PE32+, ~12 MB
 | `system.update` | ✅ Ubuntu/Debian | ✗ |
 | `vm.reboot` / `vm.shutdown` | ✅ `systemctl` | ✅ `shutdown /r` |
 | `identity.set_password` | ✅ `chpasswd` (via stdin) | ✅ `net user` (password visible in argv — see Security model) |
+| Hostname from config-drive at boot | — (set by the first-boot playbook) | ✅ `Rename-Computer`, only on a machine nobody has named yet or after the hostname changes in the panel; takes effect at the next restart, the agent never restarts the machine |
 | `network.configure` | ✅ netplan | ✅ PowerShell `New-NetIPAddress` etc. |
 | `sshkeys.add` / `.remove` / `.list` | ✅ `~/.ssh/authorized_keys` | ✅ `%USERPROFILE%\.ssh\authorized_keys` (no admin ACL support) |
 | `env.set` / `.unset` / `.list` | ✅ `/etc/environment` (new sessions only) | ✅ registry + `WM_SETTINGCHANGE` broadcast |
